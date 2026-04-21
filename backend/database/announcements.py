@@ -1,7 +1,8 @@
+"""Postgres-backed announcements (global collection, not per-user)."""
+
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
-
-from google.cloud.firestore_v1 import FieldFilter
 
 from ._client import db
 from models.announcement import Announcement, AnnouncementType, TriggerType
@@ -9,11 +10,25 @@ from models.announcement import Announcement, AnnouncementType, TriggerType
 
 def get_announcement_by_id(announcement_id: str) -> Optional[Announcement]:
     """Get a single announcement by ID."""
-    doc_ref = db.collection("announcements").document(announcement_id)
-    doc = doc_ref.get()
-    if doc.exists:
-        return Announcement.from_dict(doc.to_dict())
-    return None
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE id = %s
+                """,
+                (announcement_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            row_id, created_at, data = row
+            # Merge created_at from typed column
+            data_dict = dict(data or {})
+            data_dict.setdefault("id", row_id)
+            data_dict.setdefault("created_at", created_at)
+            return Announcement.from_dict(data_dict)
 
 
 def get_app_changelogs(from_version: str, to_version: str) -> List[Announcement]:
@@ -22,24 +37,35 @@ def get_app_changelogs(from_version: str, to_version: str) -> List[Announcement]
     Returns changelogs where from_version < app_version <= to_version.
     Sorted by app_version descending (newest first).
     """
-    announcements_ref = db.collection("announcements")
-    query = announcements_ref.where(filter=FieldFilter("type", "==", AnnouncementType.CHANGELOG.value)).where(
-        filter=FieldFilter("active", "==", True)
-    )
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE data->>'type' = %s
+                  AND data->>'active' = 'true'
+                ORDER BY created_at DESC
+                """,
+                (AnnouncementType.CHANGELOG.value,),
+            )
+            rows = cur.fetchall()
 
-    docs = query.stream()
     changelogs = []
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcement = Announcement.from_dict(data_dict)
 
-    for doc in docs:
-        data = doc.to_dict()
-        app_version = data.get("app_version")
+        app_version = announcement.app_version
         # Skip entries without app_version, then filter by version range
         if (
             app_version
             and _compare_versions(from_version, app_version) < 0
             and _compare_versions(app_version, to_version) <= 0
         ):
-            changelogs.append(Announcement.from_dict(data))
+            changelogs.append(announcement)
 
     # Sort by version descending (newest first)
     changelogs.sort(key=lambda x: _version_tuple(x.app_version), reverse=True)
@@ -52,22 +78,33 @@ def get_recent_changelogs(limit: int = 5, max_version: Optional[str] = None) -> 
     Returns up to `limit` changelogs sorted by version descending.
     If max_version is provided, only returns changelogs with app_version <= max_version.
     """
-    announcements_ref = db.collection("announcements")
-    query = announcements_ref.where(filter=FieldFilter("type", "==", AnnouncementType.CHANGELOG.value)).where(
-        filter=FieldFilter("active", "==", True)
-    )
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE data->>'type' = %s
+                  AND data->>'active' = 'true'
+                ORDER BY created_at DESC
+                """,
+                (AnnouncementType.CHANGELOG.value,),
+            )
+            rows = cur.fetchall()
 
-    docs = query.stream()
     changelogs = []
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcement = Announcement.from_dict(data_dict)
 
-    for doc in docs:
-        data = doc.to_dict()
-        app_version = data.get("app_version")
+        app_version = announcement.app_version
         if app_version:
             # Filter out versions newer than max_version if specified
             if max_version and _compare_versions(app_version, max_version) > 0:
                 continue
-            changelogs.append(Announcement.from_dict(data))
+            changelogs.append(announcement)
 
     # Sort by version descending
     changelogs.sort(key=lambda x: _version_tuple(x.app_version), reverse=True)
@@ -81,19 +118,26 @@ def get_firmware_features(firmware_version: str, device_model: Optional[str] = N
     Get feature announcements for a specific firmware version.
     Optionally filter by device model.
     """
-    announcements_ref = db.collection("announcements")
-    query = (
-        announcements_ref.where(filter=FieldFilter("type", "==", AnnouncementType.FEATURE.value))
-        .where(filter=FieldFilter("active", "==", True))
-        .where(filter=FieldFilter("firmware_version", "==", firmware_version))
-    )
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE data->>'type' = %s
+                  AND data->>'active' = 'true'
+                  AND data->>'firmware_version' = %s
+                """,
+                (AnnouncementType.FEATURE.value, firmware_version),
+            )
+            rows = cur.fetchall()
 
-    docs = query.stream()
     features = []
-
-    for doc in docs:
-        data = doc.to_dict()
-        announcement = Announcement.from_dict(data)
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcement = Announcement.from_dict(data_dict)
 
         # Filter by device model if specified
         if device_model and announcement.device_models:
@@ -109,15 +153,28 @@ def get_app_features(app_version: str) -> List[Announcement]:
     """
     Get feature announcements for a specific app version.
     """
-    announcements_ref = db.collection("announcements")
-    query = (
-        announcements_ref.where(filter=FieldFilter("type", "==", AnnouncementType.FEATURE.value))
-        .where(filter=FieldFilter("active", "==", True))
-        .where(filter=FieldFilter("app_version", "==", app_version))
-    )
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE data->>'type' = %s
+                  AND data->>'active' = 'true'
+                  AND data->>'app_version' = %s
+                """,
+                (AnnouncementType.FEATURE.value, app_version),
+            )
+            rows = cur.fetchall()
 
-    docs = query.stream()
-    return [Announcement.from_dict(doc.to_dict()) for doc in docs]
+    announcements = []
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcements.append(Announcement.from_dict(data_dict))
+
+    return announcements
 
 
 def get_general_announcements(last_checked_at: Optional[datetime] = None) -> List[Announcement]:
@@ -126,17 +183,26 @@ def get_general_announcements(last_checked_at: Optional[datetime] = None) -> Lis
     If last_checked_at is provided, only returns announcements created after that time.
     """
     now = datetime.now(timezone.utc)
-    announcements_ref = db.collection("announcements")
-    query = announcements_ref.where(filter=FieldFilter("type", "==", AnnouncementType.ANNOUNCEMENT.value)).where(
-        filter=FieldFilter("active", "==", True)
-    )
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE data->>'type' = %s
+                  AND data->>'active' = 'true'
+                ORDER BY created_at DESC
+                """,
+                (AnnouncementType.ANNOUNCEMENT.value,),
+            )
+            rows = cur.fetchall()
 
-    docs = query.stream()
     announcements = []
-
-    for doc in docs:
-        data = doc.to_dict()
-        announcement = Announcement.from_dict(data)
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcement = Announcement.from_dict(data_dict)
 
         # Skip if created before last check
         if last_checked_at and announcement.created_at <= last_checked_at:
@@ -164,60 +230,110 @@ def get_all_announcements(
         announcement_type: Filter by type (changelog, feature, announcement)
         active_only: If True, only return active announcements
     """
-    announcements_ref = db.collection("announcements")
-    query = announcements_ref
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            where_clauses = []
+            params = []
 
-    if announcement_type:
-        query = query.where(filter=FieldFilter("type", "==", announcement_type.value))
+            if announcement_type:
+                where_clauses.append("data->>'type' = %s")
+                params.append(announcement_type.value)
 
-    if active_only:
-        query = query.where(filter=FieldFilter("active", "==", True))
+            if active_only:
+                where_clauses.append("data->>'active' = 'true'")
 
-    docs = query.stream()
-    announcements = [Announcement.from_dict(doc.to_dict()) for doc in docs]
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
-    # Sort by created_at descending
-    announcements.sort(key=lambda x: x.created_at, reverse=True)
+            cur.execute(
+                f"""
+                SELECT id, created_at, data
+                FROM announcements
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    announcements = []
+    for row_id, created_at, data in rows:
+        data_dict = dict(data or {})
+        data_dict.setdefault("id", row_id)
+        data_dict.setdefault("created_at", created_at)
+        announcements.append(Announcement.from_dict(data_dict))
+
     return announcements
 
 
 def create_announcement(announcement: Announcement) -> Announcement:
-    """Create a new announcement."""
-    doc_ref = db.collection("announcements").document(announcement.id)
-    doc_ref.set(announcement.to_dict())
+    """Create a new announcement.
+
+    Promotes 'id' and stores the whole dict into the `data` JSONB column.
+    """
+    announcement_id = announcement.id
+    announcement_data = announcement.to_dict()
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO announcements (id, data)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (id) DO UPDATE
+                    SET data = EXCLUDED.data
+                """,
+                (announcement_id, json.dumps(announcement_data)),
+            )
+
     return announcement
 
 
 def update_announcement(announcement_id: str, updates: dict) -> Optional[Announcement]:
-    """Update an existing announcement."""
-    doc_ref = db.collection("announcements").document(announcement_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return None
+    """Update an existing announcement.
 
-    doc_ref.update(updates)
+    Shallow-merge updates into the existing row's data JSONB.
+    """
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE announcements
+                SET data = data || %s::jsonb
+                WHERE id = %s
+                """,
+                (json.dumps(updates), announcement_id),
+            )
+
     return get_announcement_by_id(announcement_id)
 
 
 def delete_announcement(announcement_id: str) -> bool:
     """Delete an announcement."""
-    doc_ref = db.collection("announcements").document(announcement_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return False
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM announcements
+                WHERE id = %s
+                """,
+                (announcement_id,),
+            )
 
-    doc_ref.delete()
     return True
 
 
 def deactivate_announcement(announcement_id: str) -> bool:
     """Soft delete - set active to False."""
-    doc_ref = db.collection("announcements").document(announcement_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return False
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE announcements
+                SET data = data || %s::jsonb
+                WHERE id = %s
+                """,
+                (json.dumps({"active": False}), announcement_id),
+            )
 
-    doc_ref.update({"active": False})
     return True
 
 
