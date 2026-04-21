@@ -23,7 +23,6 @@ os.environ.setdefault('ENCRYPTION_SECRET', 'omi_ZwB2ZNqB2HHpMK6wStk7sTpavJiPTFg7
 # at import time. Both stubs removed so other tests that patch them work.
 sys.modules.setdefault('database.redis_db', MagicMock())
 sys.modules.setdefault('database.users', MagicMock())
-sys.modules.setdefault('database.user_usage', MagicMock())
 sys.modules.setdefault('utils.other.storage', MagicMock())
 
 from utils.other.endpoints import verify_token  # noqa: E402
