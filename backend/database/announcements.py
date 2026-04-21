@@ -440,32 +440,66 @@ def _compare_versions(v1: str, v2: str) -> int:
 
 
 def get_dismissed_announcement_ids(uid: str) -> set:
-    """Get the set of announcement IDs that a user has dismissed."""
-    dismissed_ref = db.collection("users").document(uid).collection("dismissed_announcements")
-    docs = dismissed_ref.stream()
-    return {doc.id for doc in docs}
+    """Get the set of announcement IDs that a user has dismissed.
+
+    Dismissals are stored as an object in users.data->dismissed_announcements
+    where each key is an announcement_id.
+    """
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data->'dismissed_announcements' FROM users WHERE uid = %s",
+                (uid,),
+            )
+            row = cur.fetchone()
+            if row is None or row[0] is None:
+                return set()
+            dismissed = row[0]
+            if isinstance(dismissed, dict):
+                return set(dismissed.keys())
+            return set()
 
 
 def dismiss_announcement(uid: str, announcement_id: str, cta_clicked: bool = False) -> bool:
-    """
-    Mark an announcement as dismissed for a user.
+    """Mark an announcement as dismissed for a user.
+
+    Merges into users.data->dismissed_announcements->{announcement_id}.
     Returns True if successful.
     """
-    dismissed_ref = db.collection("users").document(uid).collection("dismissed_announcements").document(announcement_id)
-    dismissed_ref.set(
-        {
-            "dismissed_at": datetime.now(timezone.utc),
+    dismissal = {
+        announcement_id: {
+            "dismissed_at": datetime.now(timezone.utc).isoformat(),
             "cta_clicked": cta_clicked,
         }
-    )
+    }
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (uid, data)
+                VALUES (%s, jsonb_build_object('dismissed_announcements', %s::jsonb))
+                ON CONFLICT (uid) DO UPDATE
+                    SET data = jsonb_set(
+                        users.data,
+                        '{dismissed_announcements}',
+                        COALESCE(users.data->'dismissed_announcements', '{}'::jsonb) || %s::jsonb
+                    )
+                """,
+                (uid, json.dumps(dismissal), json.dumps(dismissal)),
+            )
     return True
 
 
 def is_announcement_dismissed(uid: str, announcement_id: str) -> bool:
     """Check if a user has dismissed a specific announcement."""
-    dismissed_ref = db.collection("users").document(uid).collection("dismissed_announcements").document(announcement_id)
-    doc = dismissed_ref.get()
-    return doc.exists
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data->'dismissed_announcements' ? %s FROM users WHERE uid = %s",
+                (announcement_id, uid),
+            )
+            row = cur.fetchone()
+            return bool(row and row[0])
 
 
 # ============================================================================
@@ -517,14 +551,16 @@ def get_pending_announcements(
     dismissed_ids = get_dismissed_announcement_ids(uid)
 
     # Query all active announcements
-    announcements_ref = db.collection("announcements")
-    query = announcements_ref.where(filter=FieldFilter("active", "==", True))
-    docs = query.stream()
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM announcements WHERE (data->>'active')::boolean = true"
+            )
+            rows = cur.fetchall()
 
     pending = []
 
-    for doc in docs:
-        data = doc.to_dict()
+    for (data,) in rows:
         announcement = Announcement.from_dict(data)
 
         # Get effective targeting and display configs

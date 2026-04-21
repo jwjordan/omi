@@ -17,12 +17,14 @@ os.environ.setdefault('GOOGLE_API_KEY', 'goog-test-fake-for-unit-tests')
 os.environ.setdefault('ANTHROPIC_API_KEY', 'ant-test-fake-for-unit-tests')
 os.environ.setdefault('ENCRYPTION_SECRET', 'omi_ZwB2ZNqB2HHpMK6wStk7sTpavJiPTFg7gXUHnc4tFABPU6pZ2c2DKgehtfgi4RZv')
 
-sys.modules.setdefault('database._client', MagicMock())
+# database._client is now Postgres-backed with a lazy pool (pool=None when
+# DATABASE_URL is unset, which is the unit-test default). Safe to import.
+# database.announcements was ported to Postgres and no longer hits Firestore
+# at import time. Both stubs removed so other tests that patch them work.
 sys.modules.setdefault('database.redis_db', MagicMock())
 sys.modules.setdefault('database.users', MagicMock())
 sys.modules.setdefault('database.user_usage', MagicMock())
 sys.modules.setdefault('database.llm_usage', MagicMock())
-sys.modules.setdefault('database.announcements', MagicMock())
 sys.modules.setdefault('utils.other.storage', MagicMock())
 
 from utils.other.endpoints import verify_token  # noqa: E402
