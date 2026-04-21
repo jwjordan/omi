@@ -6,13 +6,13 @@ from fastapi import Depends, Header, HTTPException, WebSocketException
 from fastapi import Request
 from starlette.websockets import WebSocket
 from firebase_admin import auth
-from firebase_admin.auth import InvalidIdTokenError
 import logging
 import redis as redis_pkg
 
 from database.redis_db import check_rate_limit, try_acquire_listen_lock
 from database.users import record_user_platform
 from utils.byok import extract_byok_from_websocket, set_byok_keys, validate_byok_request, validate_byok_websocket
+from utils.other.jwks_auth import verify_omi_id_token, InvalidOmiTokenError
 from utils.rate_limit_config import RATE_POLICIES, RATE_LIMIT_SHADOW, get_effective_limit
 
 logger = logging.getLogger(__name__)
@@ -24,28 +24,21 @@ def get_user(uid: str):
 
 
 def verify_token(token: str) -> str:
+    """Validate an auth token and return the uid.
+
+    Order of checks:
+    1. ADMIN_KEY prefix match — backend-to-backend auth (e.g. Edwin MCP tool).
+    2. JWKS validation against Omi's production Firebase project.
+    3. LOCAL_DEVELOPMENT=true fallback — returns '123' on validation failure.
     """
-    Verify a Firebase token or ADMIN_KEY and return the uid.
-
-    Args:
-        token: The token to verify (Firebase ID token or ADMIN_KEY format)
-
-    Returns:
-        The user's uid
-
-    Raises:
-        InvalidIdTokenError: If the token is invalid
-    """
-    # Check for ADMIN_KEY format
     admin_key = os.getenv('ADMIN_KEY')
     if admin_key and token.startswith(admin_key):
-        return token[len(admin_key) :]
+        return token[len(admin_key):]
 
-    # Verify Firebase token
     try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token['uid']
-    except InvalidIdTokenError:
+        decoded = verify_omi_id_token(token)
+        return decoded['sub']
+    except InvalidOmiTokenError:
         if os.getenv('LOCAL_DEVELOPMENT') == 'true':
             return '123'
         raise
@@ -72,7 +65,7 @@ def get_current_user_uid(
     try:
         token = authorization.split(' ')[1]
         uid = verify_token(token)
-    except InvalidIdTokenError as e:
+    except InvalidOmiTokenError as e:
         logger.error(e)
         raise HTTPException(status_code=401, detail="Invalid authorization token")
 
@@ -108,7 +101,7 @@ def get_current_user_uid_no_byok_validation(
     try:
         token = authorization.split(' ')[1]
         uid = verify_token(token)
-    except InvalidIdTokenError as e:
+    except InvalidOmiTokenError as e:
         logger.error(e)
         raise HTTPException(status_code=401, detail="Invalid authorization token")
 
@@ -134,7 +127,7 @@ def _verify_ws_auth(authorization: str) -> str:
     try:
         token = authorization.split(' ')[1]
         return verify_token(token)
-    except InvalidIdTokenError as e:
+    except InvalidOmiTokenError as e:
         logger.error(f"WebSocket auth failed: {e}")
         raise WebSocketException(code=1008, reason="Invalid or expired token")
     except Exception as e:
@@ -200,7 +193,7 @@ def get_current_user_uid_from_ws_message(message: dict) -> str:
 
     Raises:
         ValueError: If message format is invalid
-        InvalidIdTokenError: If token is invalid
+        InvalidOmiTokenError: If token is invalid
     """
     if message.get("type") == "websocket.disconnect":
         raise ValueError("Client disconnected")
