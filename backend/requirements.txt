@@ -155,7 +155,7 @@ pydantic_core==2.20.1
 pydeck==0.9.1
 pydub==0.25.1
 Pygments==2.18.0
-PyJWT==2.9.0
+PyJWT[crypto]==2.9.0
 pynndescent==0.5.13
 PyOgg @ git+https://github.com/TeamPyOgg/PyOgg@6871a4f234e8a3a346c4874a12509bfa02c4c63a
 pyparsing==3.1.2
