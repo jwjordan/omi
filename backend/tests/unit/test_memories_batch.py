@@ -15,11 +15,10 @@ from unittest.mock import MagicMock
 import pytest
 
 # Stub heavy deps before importing vector_db / routers.memories. These
-# modules pull in `pinecone`, `google.cloud.firestore`, `firebase_admin`, and
-# `utils.llm.clients.embeddings` at import time, none of which are available
-# (or desirable) in the unit test environment.
+# modules pull in `psycopg_pool`, `pgvector`, `google.cloud.firestore`,
+# `firebase_admin`, and `utils.llm.clients.embeddings` at import time, none of
+# which are available (or desirable) in the unit test environment.
 for mod_name in [
-    'pinecone',
     'firebase_admin',
     'firebase_admin.auth',
     'google',
@@ -29,7 +28,24 @@ for mod_name in [
     if mod_name not in sys.modules:
         sys.modules[mod_name] = types.ModuleType(mod_name)
 
-sys.modules['pinecone'].Pinecone = MagicMock
+
+# Stub psycopg_pool / pgvector so vector_db import doesn't try to open a real
+# Postgres connection. We monkeypatch `_pool` on the module in _setup_mocks
+# below to capture the SQL a real DB would have received.
+class _NoopPool:
+    def connection(self):
+        raise RuntimeError("pool not configured in this test")
+
+
+_fake_pool_mod = types.ModuleType('psycopg_pool')
+_fake_pool_mod.ConnectionPool = lambda *a, **kw: _NoopPool()
+sys.modules.setdefault('psycopg_pool', _fake_pool_mod)
+
+_fake_pgvector_pkg = types.ModuleType('pgvector')
+_fake_pgvector_psycopg = types.ModuleType('pgvector.psycopg')
+_fake_pgvector_psycopg.register_vector = lambda conn: None
+sys.modules.setdefault('pgvector', _fake_pgvector_pkg)
+sys.modules.setdefault('pgvector.psycopg', _fake_pgvector_psycopg)
 
 
 class _FakeFirestoreClient:
@@ -62,22 +78,74 @@ if 'utils.llm.clients' not in sys.modules:
 from database import vector_db  # noqa: E402
 
 
+class _FakeCursor:
+    def __init__(self):
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+
+class _FakeConn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return self._cursor
+
+    def execute(self, sql, params=None):
+        self._cursor.execute(sql, params)
+
+
+class _FakePoolCtx:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def connection(self):
+        return _FakePoolCtx(self._conn)
+
+
 class TestUpsertMemoryVectorsBatch:
-    def _setup_mocks(self, monkeypatch, *, index_none=False):
-        fake_index = MagicMock()
-        fake_index.upsert = MagicMock(return_value={'upserted_count': 2})
-        monkeypatch.setattr(vector_db, 'index', None if index_none else fake_index)
+    def _setup_mocks(self, monkeypatch, *, pool_none=False):
+        cursor = _FakeCursor()
+        conn = _FakeConn(cursor)
+        pool = _FakePool(conn)
+        monkeypatch.setattr(vector_db, 'index', None, raising=False)  # harmless tombstone
+        monkeypatch.setattr(vector_db, '_pool', None if pool_none else pool)
 
         fake_embeddings = MagicMock()
         fake_embeddings.embed_documents = MagicMock(
             side_effect=lambda texts: [[0.1 * i, 0.2 * i] for i, _ in enumerate(texts, start=1)]
         )
         monkeypatch.setattr(vector_db, 'embeddings', fake_embeddings)
-        return fake_index, fake_embeddings
+        return cursor, fake_embeddings
 
-    def test_batch_upsert_uses_single_embed_and_single_upsert(self, monkeypatch):
-        """The whole point of the helper: one embed call + one upsert call."""
-        fake_index, fake_embeddings = self._setup_mocks(monkeypatch)
+    def test_batch_upsert_uses_single_embed_and_bulk_insert(self, monkeypatch):
+        """The whole point of the helper: one embed call + one bulk DB write."""
+        cursor, fake_embeddings = self._setup_mocks(monkeypatch)
 
         items = [
             {'memory_id': 'm1', 'content': 'apple', 'category': 'manual'},
@@ -90,28 +158,26 @@ class TestUpsertMemoryVectorsBatch:
         assert written == 3
         # Exactly one embeddings call, with all three contents.
         fake_embeddings.embed_documents.assert_called_once_with(['apple', 'banana', 'cherry'])
-        # Exactly one Pinecone upsert, with all three vectors.
-        fake_index.upsert.assert_called_once()
-        kwargs = fake_index.upsert.call_args.kwargs
-        assert kwargs['namespace'] == vector_db.MEMORIES_NAMESPACE
-        vectors = kwargs['vectors']
-        assert [v['id'] for v in vectors] == ['uid-abc-m1', 'uid-abc-m2', 'uid-abc-m3']
-        assert [v['metadata']['memory_id'] for v in vectors] == ['m1', 'm2', 'm3']
-        assert [v['metadata']['category'] for v in vectors] == ['manual', 'manual', 'interesting']
-        assert all(v['metadata']['uid'] == 'uid-abc' for v in vectors)
+        # Three INSERTs into memory_vectors, all referencing uid-abc.
+        assert len(cursor.executed) == 3
+        ids = [call[1][0] for call in cursor.executed]
+        assert ids == ['uid-abc-m1', 'uid-abc-m2', 'uid-abc-m3']
+        for sql, _params in cursor.executed:
+            assert 'memory_vectors' in sql
+            assert 'INSERT' in sql.upper()
 
     def test_batch_upsert_empty_list_is_noop(self, monkeypatch):
-        fake_index, fake_embeddings = self._setup_mocks(monkeypatch)
+        cursor, fake_embeddings = self._setup_mocks(monkeypatch)
 
         written = vector_db.upsert_memory_vectors_batch('uid-abc', [])
 
         assert written == 0
         fake_embeddings.embed_documents.assert_not_called()
-        fake_index.upsert.assert_not_called()
+        assert cursor.executed == []
 
-    def test_batch_upsert_skips_when_pinecone_not_configured(self, monkeypatch):
-        """Helper must no-op cleanly when Pinecone isn't configured (tests, local dev)."""
-        _, fake_embeddings = self._setup_mocks(monkeypatch, index_none=True)
+    def test_batch_upsert_skips_when_pool_not_configured(self, monkeypatch):
+        """Helper must no-op cleanly when Postgres isn't configured (tests, local dev)."""
+        _, fake_embeddings = self._setup_mocks(monkeypatch, pool_none=True)
 
         written = vector_db.upsert_memory_vectors_batch(
             'uid-abc',
