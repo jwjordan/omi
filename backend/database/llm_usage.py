@@ -1,14 +1,19 @@
 """
 LLM Usage Database Operations.
 
-Stores and queries LLM token usage by feature in Firestore.
-Schema: users/{uid}/llm_usage/{date} -> {feature -> {model -> {input_tokens, output_tokens}}}
+Stores and queries LLM token usage by feature in Postgres.
+Schema: llm_usage (per-user) — uid, id (date string), created_at, data (JSONB)
+Table structure:
+- uid        TEXT NOT NULL
+- id         TEXT NOT NULL (date string like '2026-04-21')
+- created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+- data       JSONB NOT NULL DEFAULT '{}'::jsonb
+- PRIMARY KEY (uid, id)
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
-
-from google.cloud import firestore
 
 from ._client import db
 
@@ -23,7 +28,7 @@ def record_llm_usage(
     """
     Record LLM token usage for a user and feature.
 
-    Uses Firestore atomic increments for safe concurrent updates.
+    Uses Postgres JSONB merge for safe concurrent updates.
 
     Args:
         uid: User ID
@@ -38,12 +43,7 @@ def record_llm_usage(
     now = datetime.now(timezone.utc)
     doc_id = f"{now.year}-{now.month:02d}-{now.day:02d}"
 
-    user_ref = db.collection("users").document(uid)
-    usage_ref = user_ref.collection("llm_usage").document(doc_id)
-
-    # Use nested field paths for atomic increments
-    # Structure: {feature}.{model}.{input_tokens|output_tokens}
-    # Firestore doesn't allow '.', '/', '[', ']', '*', '`', '~' in field names
+    # Sanitize model name (Firestore constraint; carry forward for consistency)
     if not isinstance(model, str) or not model:
         model = "unknown"
 
@@ -57,15 +57,46 @@ def record_llm_usage(
         .replace("`", "_")
     )
 
-    update_data = {
-        f"{feature}.{safe_model}.input_tokens": firestore.Increment(input_tokens),
-        f"{feature}.{safe_model}.output_tokens": firestore.Increment(output_tokens),
-        f"{feature}.{safe_model}.call_count": firestore.Increment(1),
-        "date": doc_id,  # Store date as a field for collection-group queries
-        "last_updated": datetime.now(timezone.utc),
-    }
+    # Read current data, merge, then write atomically
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            # Fetch existing row with row-level lock
+            cur.execute(
+                "SELECT data FROM llm_usage WHERE uid = %s AND id = %s FOR UPDATE",
+                (uid, doc_id),
+            )
+            row = cur.fetchone()
+            current_data = row[0] if row else {}
 
-    usage_ref.set(update_data, merge=True)
+            # Merge new counters into current data
+            if feature not in current_data:
+                current_data[feature] = {}
+
+            if safe_model not in current_data[feature]:
+                current_data[feature][safe_model] = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "call_count": 0,
+                }
+
+            current_data[feature][safe_model]["input_tokens"] += input_tokens
+            current_data[feature][safe_model]["output_tokens"] += output_tokens
+            current_data[feature][safe_model]["call_count"] += 1
+
+            # Update metadata
+            current_data["date"] = doc_id
+            current_data["last_updated"] = now.isoformat()
+
+            # Upsert
+            cur.execute(
+                """
+                INSERT INTO llm_usage (uid, id, data)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (uid, id) DO UPDATE
+                SET data = EXCLUDED.data
+                """,
+                (uid, doc_id, json.dumps(current_data)),
+            )
 
 
 def get_daily_usage(uid: str, date: Optional[datetime] = None) -> Dict:
@@ -83,13 +114,17 @@ def get_daily_usage(uid: str, date: Optional[datetime] = None) -> Dict:
         date = datetime.now(timezone.utc)
 
     doc_id = f"{date.year}-{date.month:02d}-{date.day:02d}"
-    user_ref = db.collection("users").document(uid)
-    usage_ref = user_ref.collection("llm_usage").document(doc_id)
 
-    doc = usage_ref.get()
-    if doc.exists:
-        return doc.to_dict()
-    return {}
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM llm_usage WHERE uid = %s AND id = %s",
+                (uid, doc_id),
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0] or {}
+            return {}
 
 
 def get_usage_summary(uid: str, days: int = 30) -> Dict:
@@ -103,22 +138,27 @@ def get_usage_summary(uid: str, days: int = 30) -> Dict:
     Returns:
         Dict with total usage by feature
     """
-    user_ref = db.collection("users").document(uid)
-    usage_collection = user_ref.collection("llm_usage")
-
-    # Query last N days
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_id = f"{cutoff.year}-{cutoff.month:02d}-{cutoff.day:02d}"
 
-    docs = usage_collection.where("__name__", ">=", cutoff_id).stream()
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, data FROM llm_usage WHERE uid = %s AND id >= %s ORDER BY id DESC",
+                (uid, cutoff_id),
+            )
+            rows = cur.fetchall()
 
     # Aggregate by feature
     summary: Dict[str, Dict[str, int]] = {}
 
-    for doc in docs:
-        data = doc.to_dict()
+    for row in rows:
+        doc_id, data = row
+        if data is None:
+            continue
+
         for feature, models in data.items():
-            if feature in ("last_updated",):
+            if feature in ("date", "last_updated"):
                 continue
             if not isinstance(models, dict):
                 continue
@@ -180,17 +220,24 @@ def get_global_top_features(days: int = 30, limit: int = 3) -> List[Dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_id = f"{cutoff.year}-{cutoff.month:02d}-{cutoff.day:02d}"
 
-    # Query all users' llm_usage subcollections
-    # Note: This is a collection group query; use 'date' field instead of __name__
-    # since __name__ comparisons don't work reliably for collection-group queries
-    usage_query = db.collection_group("llm_usage").where("date", ">=", cutoff_id)
+    # Query all users' llm_usage rows (no uid filter)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, data FROM llm_usage WHERE id >= %s",
+                (cutoff_id,),
+            )
+            rows = cur.fetchall()
 
     global_summary: Dict[str, Dict[str, int]] = {}
 
-    for doc in usage_query.stream():
-        data = doc.to_dict()
+    for row in rows:
+        doc_id, data = row
+        if data is None:
+            continue
+
         for feature, models in data.items():
-            if feature in ("last_updated",):
+            if feature in ("date", "last_updated"):
                 continue
             if not isinstance(models, dict):
                 continue
@@ -229,7 +276,7 @@ def get_global_top_features(days: int = 30, limit: int = 3) -> List[Dict]:
 # total_tokens, cost_usd, call_count.
 #
 # This differs from the {feature}.{model} nesting above.  Both schemas
-# coexist in the same date-keyed documents using Firestore's schemaless design.
+# coexist in the same date-keyed documents using Postgres's schemaless JSONB design.
 # ============================================================================
 
 
@@ -250,28 +297,47 @@ def record_llm_usage_bucket(
     (``{bucket}_{account}``) for per-account breakdown.
     """
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    ref = db.collection("users").document(uid).collection("llm_usage").document(today)
 
-    acct_key = f'{bucket}_{account}'
-    update = {
-        f'{bucket}.input_tokens': firestore.Increment(input_tokens),
-        f'{bucket}.output_tokens': firestore.Increment(output_tokens),
-        f'{bucket}.cache_read_tokens': firestore.Increment(cache_read_tokens),
-        f'{bucket}.cache_write_tokens': firestore.Increment(cache_write_tokens),
-        f'{bucket}.total_tokens': firestore.Increment(total_tokens),
-        f'{bucket}.cost_usd': firestore.Increment(cost_usd),
-        f'{bucket}.call_count': firestore.Increment(1),
-        f'{acct_key}.input_tokens': firestore.Increment(input_tokens),
-        f'{acct_key}.output_tokens': firestore.Increment(output_tokens),
-        f'{acct_key}.cache_read_tokens': firestore.Increment(cache_read_tokens),
-        f'{acct_key}.cache_write_tokens': firestore.Increment(cache_write_tokens),
-        f'{acct_key}.total_tokens': firestore.Increment(total_tokens),
-        f'{acct_key}.cost_usd': firestore.Increment(cost_usd),
-        f'{acct_key}.call_count': firestore.Increment(1),
-        'date': today,
-        'last_updated': datetime.now(timezone.utc),
-    }
-    ref.set(update, merge=True)
+    # Read current data, merge, then write atomically
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            # Fetch existing row with row-level lock
+            cur.execute(
+                "SELECT data FROM llm_usage WHERE uid = %s AND id = %s FOR UPDATE",
+                (uid, today),
+            )
+            row = cur.fetchone()
+            current_data = row[0] if row else {}
+
+            # Merge bucket data
+            acct_key = f'{bucket}_{account}'
+
+            for key in [bucket, acct_key]:
+                if key not in current_data:
+                    current_data[key] = {}
+
+                current_data[key]["input_tokens"] = current_data[key].get("input_tokens", 0) + input_tokens
+                current_data[key]["output_tokens"] = current_data[key].get("output_tokens", 0) + output_tokens
+                current_data[key]["cache_read_tokens"] = current_data[key].get("cache_read_tokens", 0) + cache_read_tokens
+                current_data[key]["cache_write_tokens"] = current_data[key].get("cache_write_tokens", 0) + cache_write_tokens
+                current_data[key]["total_tokens"] = current_data[key].get("total_tokens", 0) + total_tokens
+                current_data[key]["cost_usd"] = current_data[key].get("cost_usd", 0.0) + cost_usd
+                current_data[key]["call_count"] = current_data[key].get("call_count", 0) + 1
+
+            # Update metadata
+            current_data["date"] = today
+            current_data["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+            # Upsert
+            cur.execute(
+                """
+                INSERT INTO llm_usage (uid, id, data)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (uid, id) DO UPDATE
+                SET data = EXCLUDED.data
+                """,
+                (uid, today, json.dumps(current_data)),
+            )
 
 
 def get_total_llm_cost(uid: str, bucket: str = 'desktop_chat') -> float:
@@ -280,11 +346,21 @@ def get_total_llm_cost(uid: str, bucket: str = 'desktop_chat') -> float:
     When the bucket dual-writes to both ``{bucket}`` and ``{bucket}_{account}``,
     this reads only the primary bucket to avoid double-counting.
     """
-    col = db.collection("users").document(uid).collection("llm_usage")
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, data FROM llm_usage WHERE uid = %s",
+                (uid,),
+            )
+            rows = cur.fetchall()
+
     total = 0.0
-    for doc in col.stream():
-        data = doc.to_dict()
-        dc = data.get(bucket)
-        if isinstance(dc, dict):
-            total += dc.get('cost_usd', 0.0)
+    for row in rows:
+        doc_id, data = row
+        if data is None:
+            continue
+        bucket_data = data.get(bucket)
+        if isinstance(bucket_data, dict):
+            total += bucket_data.get('cost_usd', 0.0)
+
     return round(total, 6)
