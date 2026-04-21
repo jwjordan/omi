@@ -92,6 +92,14 @@ class _FakeCursor:
         self.executed.append((sql, params))
 
 
+class _FakeTxn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 class _FakeConn:
     def __init__(self, cursor):
         self._cursor = cursor
@@ -107,6 +115,9 @@ class _FakeConn:
 
     def execute(self, sql, params=None):
         self._cursor.execute(sql, params)
+
+    def transaction(self):
+        return _FakeTxn()
 
 
 class _FakePoolCtx:

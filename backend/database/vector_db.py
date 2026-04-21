@@ -158,25 +158,26 @@ def update_vector_metadata(uid: str, conversation_id: str, metadata: dict):
 
 
 def upsert_vectors(uid: str, vectors: List[List[float]], conversation_ids: List[str]):
-    """Batch-upsert conversation embeddings in one transaction."""
+    """Batch-upsert conversation embeddings atomically: all rows commit or none do."""
     if not vectors:
         return
     now = _now_ts()
     with _connection() as conn:
-        with conn.cursor() as cur:
-            for cid, vec in zip(conversation_ids, vectors):
-                meta = {"uid": uid, "memory_id": cid, "created_at": now}
-                cur.execute(
-                    _UPSERT_CONV_SQL,
-                    (
-                        f"{uid}-{cid}",
-                        uid,
-                        cid,
-                        now,
-                        list(vec),
-                        json.dumps(meta),
-                    ),
-                )
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for cid, vec in zip(conversation_ids, vectors):
+                    meta = {"uid": uid, "memory_id": cid, "created_at": now}
+                    cur.execute(
+                        _UPSERT_CONV_SQL,
+                        (
+                            f"{uid}-{cid}",
+                            uid,
+                            cid,
+                            now,
+                            list(vec),
+                            json.dumps(meta),
+                        ),
+                    )
     logger.info("upsert_vectors uid=%s count=%d", uid, len(vectors))
 
 
@@ -371,26 +372,27 @@ def upsert_memory_vectors_batch(uid: str, items: List[dict]) -> int:
     now = _now_ts()
 
     with _connection() as conn:
-        with conn.cursor() as cur:
-            for item, vec in zip(items, vectors):
-                meta = {
-                    "uid": uid,
-                    "memory_id": item["memory_id"],
-                    "category": item["category"],
-                    "created_at": now,
-                }
-                cur.execute(
-                    _UPSERT_MEM_SQL,
-                    (
-                        f"{uid}-{item['memory_id']}",
-                        uid,
-                        item["memory_id"],
-                        item["category"],
-                        now,
-                        list(vec),
-                        json.dumps(meta),
-                    ),
-                )
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for item, vec in zip(items, vectors):
+                    meta = {
+                        "uid": uid,
+                        "memory_id": item["memory_id"],
+                        "category": item["category"],
+                        "created_at": now,
+                    }
+                    cur.execute(
+                        _UPSERT_MEM_SQL,
+                        (
+                            f"{uid}-{item['memory_id']}",
+                            uid,
+                            item["memory_id"],
+                            item["category"],
+                            now,
+                            list(vec),
+                            json.dumps(meta),
+                        ),
+                    )
 
     logger.info("upsert_memory_vectors_batch count=%d", len(items))
     return len(items)

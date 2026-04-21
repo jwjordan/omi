@@ -48,6 +48,14 @@ class _FakeCursor:
         return self._rows[0] if self._rows else None
 
 
+class _FakeTxn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 class _FakeConnection:
     def __init__(self, cursor):
         self._cursor = cursor
@@ -63,6 +71,9 @@ class _FakeConnection:
 
     def execute(self, sql, params=None):
         return self._cursor.execute(sql, params)
+
+    def transaction(self):
+        return _FakeTxn()
 
 
 class _FakePoolContext:
