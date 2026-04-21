@@ -12,10 +12,13 @@ Env vars:
                   (converted to JWK format). For tests, point at a file:// URL.
 """
 
+import logging
 import os
 
 import jwt
 from jwt import PyJWKClient, InvalidTokenError
+
+logger = logging.getLogger(__name__)
 
 
 class InvalidOmiTokenError(Exception):

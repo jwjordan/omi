@@ -94,3 +94,6 @@ scipy==1.14.0
 
 # Audio transcription (via speaker_sample -> pre_recorded -> fal_client)
 fal_client==0.4.1
+psycopg[binary]>=3.2
+psycopg_pool>=3.2
+pgvector>=0.3
