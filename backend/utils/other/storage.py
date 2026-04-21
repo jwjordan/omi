@@ -48,11 +48,22 @@ app_thumbnails_bucket = os.getenv('BUCKET_APP_THUMBNAILS')
 chat_files_bucket = os.getenv('BUCKET_CHAT_FILES')
 desktop_updates_bucket = os.getenv('BUCKET_DESKTOP_UPDATES')
 
+# pendant-stack: when STORAGE_DISABLED=true, short-circuit storage functions to
+# return empty / False instead of calling GCS. Firebase Storage now requires the
+# Blaze plan (billing) and the pendant use case doesn't need blob storage for
+# Stage 1b — speech profile training and conversation-audio uploads are both
+# deferred. Writes become no-ops, existence checks return False, listings empty.
+STORAGE_DISABLED = os.getenv('STORAGE_DISABLED', 'false').lower() in ('true', '1', 'yes')
+if STORAGE_DISABLED:
+    logger.warning("STORAGE_DISABLED=true: all cloud-storage functions will short-circuit")
+
 
 # *******************************************
 # ************* SPEECH PROFILE **************
 # *******************************************
 def upload_profile_audio(file_path: str, uid: str):
+    if STORAGE_DISABLED:
+        return ''
     bucket = storage_client.bucket(speech_profiles_bucket)
     path = f'{uid}/speech_profile.wav'
     blob = bucket.blob(path)
@@ -61,6 +72,8 @@ def upload_profile_audio(file_path: str, uid: str):
 
 
 def get_user_has_speech_profile(uid: str, max_age_days: int = None) -> bool:
+    if STORAGE_DISABLED:
+        return False
     bucket = storage_client.bucket(speech_profiles_bucket)
     blob = bucket.blob(f'{uid}/speech_profile.wav')
     if not blob.exists():
@@ -78,6 +91,8 @@ def get_user_has_speech_profile(uid: str, max_age_days: int = None) -> bool:
 
 
 def get_profile_audio_if_exists(uid: str, download: bool = True) -> str:
+    if STORAGE_DISABLED:
+        return None
     bucket = storage_client.bucket(speech_profiles_bucket)
     path = f'{uid}/speech_profile.wav'
     blob = bucket.blob(path)
@@ -92,6 +107,8 @@ def get_profile_audio_if_exists(uid: str, download: bool = True) -> str:
 
 
 def delete_additional_profile_audio(uid: str, file_name: str) -> None:
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(speech_profiles_bucket)
     blob = bucket.blob(f'{uid}/additional_profile_recordings/{file_name}')
     if blob.exists():
@@ -100,6 +117,8 @@ def delete_additional_profile_audio(uid: str, file_name: str) -> None:
 
 
 def get_additional_profile_recordings(uid: str, download: bool = False) -> List[str]:
+    if STORAGE_DISABLED:
+        return []
     bucket = storage_client.bucket(speech_profiles_bucket)
     blobs = bucket.list_blobs(prefix=f'{uid}/additional_profile_recordings/')
     if download:
@@ -119,6 +138,8 @@ def get_additional_profile_recordings(uid: str, download: bool = False) -> List[
 
 
 def delete_user_person_speech_sample(uid: str, person_id: str, file_name: str) -> None:
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(speech_profiles_bucket)
     blob = bucket.blob(f'{uid}/people_profiles/{person_id}/{file_name}')
     if blob.exists():
@@ -126,6 +147,8 @@ def delete_user_person_speech_sample(uid: str, person_id: str, file_name: str) -
 
 
 def delete_user_person_speech_samples(uid: str, person_id: str) -> None:
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(speech_profiles_bucket)
     blobs = bucket.list_blobs(prefix=f'{uid}/people_profiles/{person_id}/')
     for blob in blobs:
@@ -139,6 +162,8 @@ def upload_person_speech_sample_from_bytes(
     sample_rate: int = 16000,
 ) -> str:
     """Upload PCM audio bytes as WAV speech sample. Returns GCS path."""
+    if STORAGE_DISABLED:
+        return ''
     import uuid as uuid_module
 
     wav_buffer = io.BytesIO()
@@ -158,6 +183,8 @@ def upload_person_speech_sample_from_bytes(
 
 
 def get_user_people_ids(uid: str) -> List[str]:
+    if STORAGE_DISABLED:
+        return []
     bucket = storage_client.bucket(speech_profiles_bucket)
     blobs = bucket.list_blobs(prefix=f'{uid}/people_profiles/')
     return [blob.name.split("/")[-2] for blob in blobs]
