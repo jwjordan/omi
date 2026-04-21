@@ -72,34 +72,29 @@ def test_get_app_changelogs_filters_by_version_range():
             (
                 "ann1",
                 now,
-                json.dumps({
+                {
                     "id": "ann1",
                     "type": "changelog",
                     "created_at": now_str,
                     "active": True,
                     "app_version": "1.0.2",
                     "content": {},
-                }),
+                },
             ),
             (
                 "ann2",
                 now,
-                json.dumps({
+                {
                     "id": "ann2",
                     "type": "changelog",
                     "created_at": now_str,
                     "active": True,
                     "app_version": "1.0.3",
                     "content": {},
-                }),
+                },
             ),
         ]
-        # Convert JSON strings to dicts for the mock
-        parsed_rows = [
-            (row[0], row[1], json.loads(row[2]) if isinstance(row[2], str) else row[2])
-            for row in rows
-        ]
-        cur.fetchall.return_value = parsed_rows
+        cur.fetchall.return_value = rows
 
         from database.announcements import get_app_changelogs
 
@@ -202,21 +197,15 @@ def test_get_app_features_returns_features_for_version():
 
         now = datetime.now(timezone.utc)
         now_str = now.isoformat()
-        rows = [
-            (
-                "feat1",
-                now,
-                json.dumps({
-                    "id": "feat1",
-                    "type": "feature",
-                    "created_at": now_str,
-                    "active": True,
-                    "app_version": "1.0.5",
-                    "content": {},
-                }),
-            ),
-        ]
-        cur.fetchall.return_value = rows
+        data_dict = {
+            "id": "feat1",
+            "type": "feature",
+            "created_at": now_str,
+            "active": True,
+            "app_version": "1.0.5",
+            "content": {},
+        }
+        cur.fetchall.return_value = [("feat1", now, data_dict)]
 
         from database.announcements import get_app_features
 
@@ -234,20 +223,14 @@ def test_get_general_announcements_filters_by_time():
 
         now = datetime.now(timezone.utc)
         now_str = now.isoformat()
-        rows = [
-            (
-                "ann1",
-                now,
-                json.dumps({
-                    "id": "ann1",
-                    "type": "announcement",
-                    "created_at": now_str,
-                    "active": True,
-                    "content": {},
-                }),
-            ),
-        ]
-        cur.fetchall.return_value = rows
+        data_dict = {
+            "id": "ann1",
+            "type": "announcement",
+            "created_at": now_str,
+            "active": True,
+            "content": {},
+        }
+        cur.fetchall.return_value = [("ann1", now, data_dict)]
 
         from database.announcements import get_general_announcements
 
@@ -264,20 +247,14 @@ def test_get_all_announcements_with_filters():
 
         now = datetime.now(timezone.utc)
         now_str = now.isoformat()
-        rows = [
-            (
-                "ann1",
-                now,
-                json.dumps({
-                    "id": "ann1",
-                    "type": "changelog",
-                    "created_at": now_str,
-                    "active": True,
-                    "content": {},
-                }),
-            ),
-        ]
-        cur.fetchall.return_value = rows
+        data_dict = {
+            "id": "ann1",
+            "type": "changelog",
+            "created_at": now_str,
+            "active": True,
+            "content": {},
+        }
+        cur.fetchall.return_value = [("ann1", now, data_dict)]
 
         from database.announcements import get_all_announcements
 
@@ -321,24 +298,24 @@ def test_update_announcement_merges_data():
 
         now = datetime.now(timezone.utc)
         now_str = now.isoformat()
-        cur.fetchone.return_value = (
-            "ann1",
-            now,
-            json.dumps({
-                "id": "ann1",
-                "type": "changelog",
-                "created_at": now_str,
-                "active": True,
-                "content": {},
-            }),
-        )
+        data_dict = {
+            "id": "ann1",
+            "type": "changelog",
+            "created_at": now_str,
+            "active": True,
+            "content": {},
+        }
+        cur.fetchone.return_value = ("ann1", now, data_dict)
 
         from database.announcements import update_announcement
 
         result = update_announcement("ann1", {"active": False})
 
-        sql = cur.execute.call_args.args[0]
-        assert "UPDATE announcements" in sql
+        # check_call_args returns list of all calls; we want the UPDATE call
+        assert cur.execute.call_count >= 1
+        # Last call should be the SELECT from get_announcement_by_id, so check any UPDATE
+        sql_calls = [call.args[0] for call in cur.execute.call_args_list]
+        assert any("UPDATE announcements" in sql for sql in sql_calls)
         assert result is not None
 
 

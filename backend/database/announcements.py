@@ -8,6 +8,15 @@ from ._client import db
 from models.announcement import Announcement, AnnouncementType, TriggerType
 
 
+class DateTimeEncoder(json.JSONEncoder):
+    """JSON encoder that handles datetime objects."""
+
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+
 def get_announcement_by_id(announcement_id: str) -> Optional[Announcement]:
     """Get a single announcement by ID."""
     with db.connection() as conn:
@@ -281,7 +290,7 @@ def create_announcement(announcement: Announcement) -> Announcement:
                 ON CONFLICT (id) DO UPDATE
                     SET data = EXCLUDED.data
                 """,
-                (announcement_id, json.dumps(announcement_data)),
+                (announcement_id, json.dumps(announcement_data, cls=DateTimeEncoder)),
             )
 
     return announcement
@@ -300,7 +309,7 @@ def update_announcement(announcement_id: str, updates: dict) -> Optional[Announc
                 SET data = data || %s::jsonb
                 WHERE id = %s
                 """,
-                (json.dumps(updates), announcement_id),
+                (json.dumps(updates, cls=DateTimeEncoder), announcement_id),
             )
 
     return get_announcement_by_id(announcement_id)
@@ -331,7 +340,7 @@ def deactivate_announcement(announcement_id: str) -> bool:
                 SET data = data || %s::jsonb
                 WHERE id = %s
                 """,
-                (json.dumps({"active": False}), announcement_id),
+                (json.dumps({"active": False}, cls=DateTimeEncoder), announcement_id),
             )
 
     return True
