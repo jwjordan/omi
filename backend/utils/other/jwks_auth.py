@@ -13,7 +13,6 @@ Env vars:
 """
 
 import os
-from typing import Optional
 
 import jwt
 from jwt import PyJWKClient, InvalidTokenError
@@ -28,21 +27,19 @@ _DEFAULT_JWKS_URL = (
     "securetoken@system.gserviceaccount.com"
 )
 
-_jwks_client: Optional[PyJWKClient] = None
+
+def _build_jwks_client() -> PyJWKClient:
+    url = os.environ.get("OMI_JWKS_URL", _DEFAULT_JWKS_URL)
+    return PyJWKClient(url, cache_keys=True, lifespan=3600)
 
 
-def _get_jwks_client() -> PyJWKClient:
-    global _jwks_client
-    if _jwks_client is None:
-        url = os.environ.get("OMI_JWKS_URL", _DEFAULT_JWKS_URL)
-        _jwks_client = PyJWKClient(url, cache_keys=True, lifespan=3600)
-    return _jwks_client
+_jwks_client: PyJWKClient = _build_jwks_client()
 
 
 def _reset_jwks_client_for_testing() -> None:
-    """Reset the module-level client cache so tests can swap OMI_JWKS_URL."""
+    """Rebuild the module-level client so tests can swap OMI_JWKS_URL."""
     global _jwks_client
-    _jwks_client = None
+    _jwks_client = _build_jwks_client()
 
 
 def verify_omi_id_token(token: str) -> dict:
@@ -58,9 +55,9 @@ def verify_omi_id_token(token: str) -> dict:
         )
 
     try:
-        signing_key = _get_jwks_client().get_signing_key_from_jwt(token).key
+        signing_key = _jwks_client.get_signing_key_from_jwt(token).key
     except Exception as e:
-        raise InvalidOmiTokenError(f"failed to resolve signing key: {e}") from e
+        raise InvalidOmiTokenError("failed to resolve signing key") from e
 
     try:
         decoded = jwt.decode(
@@ -78,6 +75,6 @@ def verify_omi_id_token(token: str) -> dict:
     except jwt.InvalidIssuerError as e:
         raise InvalidOmiTokenError("invalid issuer") from e
     except InvalidTokenError as e:
-        raise InvalidOmiTokenError(f"invalid token: {e}") from e
+        raise InvalidOmiTokenError(f"invalid token: {type(e).__name__}") from e
 
     return decoded

@@ -50,7 +50,10 @@ def jwks_url(rsa_keypair, tmp_path_factory, monkeypatch_session):
     monkeypatch_session.setenv("OMI_JWKS_URL", url)
     import utils.other.jwks_auth as mod
     mod._reset_jwks_client_for_testing()
-    yield url
+    try:
+        yield url
+    finally:
+        mod._reset_jwks_client_for_testing()
 
 
 @pytest.fixture(scope="session")
