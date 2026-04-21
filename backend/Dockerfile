@@ -31,7 +31,10 @@ RUN git clone https://github.com/google/liblc3.git && \
 # Install Python requirements
 WORKDIR /opt/venv
 COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade -r /tmp/requirements.txt
+# --find-links points pip at the local wheel dir so our arm64-built lc3py
+# from the liblc3 git checkout above is used instead of the missing PyPI
+# arm64 wheel for lc3py==1.1.3.
+RUN pip install --no-cache-dir --upgrade --find-links=/tmp/wheels -r /tmp/requirements.txt
 
 FROM python:3.11-slim
 
