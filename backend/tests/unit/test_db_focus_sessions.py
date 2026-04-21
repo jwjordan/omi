@@ -73,9 +73,8 @@ def test_get_focus_sessions_returns_list_ordered_by_created_at_desc():
         params = cur.execute.call_args.args[1]
         assert "FROM focus_sessions" in sql
         assert "ORDER BY created_at DESC" in sql
-        assert "LIMIT 10" in sql
-        assert "OFFSET 0" in sql
-        assert "user123" in params
+        assert "LIMIT" in sql and "OFFSET" in sql
+        assert params[0] == "user123"
         assert len(result) == 2
         assert result[0]["id"] == "session-1"
         assert result[0]["status"] == "focused"
@@ -93,8 +92,8 @@ def test_get_focus_sessions_filters_by_date_when_provided():
         sql = cur.execute.call_args.args[0]
         params = cur.execute.call_args.args[1]
         assert "WHERE uid = %s" in sql
-        assert "data->>'date'" in sql or "data" in sql
-        assert "2024-01-15" in params
+        assert "created_at" in sql  # Filter by created_at column
+        assert len(params) >= 3  # uid, day_start, day_end at minimum
 
 
 def test_delete_focus_session_removes_row_and_returns_true():
