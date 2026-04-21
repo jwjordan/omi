@@ -39,7 +39,14 @@ WORKDIR /app
 ENV PATH="/opt/venv/bin:$PATH"
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
-RUN apt-get update && apt-get -y install ffmpeg curl && rm -rf /var/lib/apt/lists/*
+# Trust the pendant-stack local CA for DNS-redirected hosts (e.g. api.deepgram.com).
+# The CA file is mounted by docker-compose at /usr/local/share/ca-certificates/pendant-ca.crt.
+# Runtime update-ca-certificates (via entrypoint) picks it up because the mount isn't
+# available at image-build time.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+RUN apt-get update && apt-get -y install ffmpeg curl ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled liblc3 library from builder staging dir
 COPY --from=builder /opt/liblc3/ /usr/local/lib/
@@ -52,6 +59,10 @@ RUN ldconfig && \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY backend/ .
+
+COPY backend/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+ENTRYPOINT ["/docker-entrypoint.sh"]
 
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--loop", "uvloop"]
