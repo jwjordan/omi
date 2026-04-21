@@ -3,13 +3,13 @@ from typing import Optional
 from fastapi import APIRouter, Request, HTTPException, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-import firebase_admin.auth
 import httpx
 
 from database.apps import get_app_by_id_db
 from utils.http_client import get_auth_client
 from database.redis_db import enable_app, increase_app_installs_count
 from utils.apps import is_user_app_enabled, get_is_user_paid_app, is_tester
+from utils.other.jwks_auth import verify_omi_id_token, InvalidOmiTokenError
 from models.app import App as AppModel, ActionType
 
 router = APIRouter(
@@ -113,12 +113,12 @@ async def oauth_authorize(
 @router.post("/v1/oauth/token")
 async def oauth_token(firebase_id_token: str = Form(...), app_id: str = Form(...), state: Optional[str] = Form(None)):
     try:
-        decoded_token = firebase_admin.auth.verify_id_token(firebase_id_token)
-        uid = decoded_token['uid']
-    except firebase_admin.auth.InvalidIdTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid Firebase ID token: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Error verifying Firebase ID token: {e}")
+        decoded_token = verify_omi_id_token(firebase_id_token)
+        uid = decoded_token['sub']
+    except InvalidOmiTokenError:
+        raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Error verifying Firebase ID token")
 
     app_data = get_app_by_id_db(app_id)
     if not app_data:
