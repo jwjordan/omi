@@ -2,6 +2,7 @@
 
 import os
 import sys
+import types
 from unittest.mock import MagicMock
 
 # Set encryption secret before any imports that depend on it
@@ -19,3 +20,11 @@ sys.modules["database.redis_db"] = MagicMock()
 
 # Mock utils.subscription since it uses Python 3.10+ syntax (int | None)
 sys.modules["utils.subscription"] = MagicMock()
+
+# Stub utils.llm.clients so modules that import `embeddings` from it can be
+# loaded without the full anthropic/langchain/tiktoken chain.  Tests that need
+# a specific embeddings behaviour patch the name on the module under test.
+if "utils.llm.clients" not in sys.modules:
+    _clients_stub = types.ModuleType("utils.llm.clients")
+    _clients_stub.embeddings = MagicMock()
+    sys.modules["utils.llm.clients"] = _clients_stub
