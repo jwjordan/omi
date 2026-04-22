@@ -155,13 +155,15 @@ def semantic_search_conversations(
         excerpts: List[Dict[str, Any]] = []
         try:
             decrypted = _decrypt_conversation_data(data, uid)
-            segments = decrypted.get("transcript_segments", []) or []
-            if isinstance(segments, list):
-                excerpts = _pick_excerpts(segments, terms)
         except Exception:
             # Per spec: per-hit decryption failure yields empty excerpts,
             # it does not fail the request.
-            excerpts = []
+            decrypted = None
+
+        if decrypted is not None:
+            segments = decrypted.get("transcript_segments", []) or []
+            if isinstance(segments, list):
+                excerpts = _pick_excerpts(segments, terms)
 
         hits.append(
             {

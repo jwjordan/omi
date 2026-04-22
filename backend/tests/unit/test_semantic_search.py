@@ -149,11 +149,48 @@ def test_since_and_until_passed_as_sql_params():
             until="2026-04-23T00:00:00Z",
             limit=5,
         )
+        sql = cur.execute.call_args.args[0]
         params = cur.execute.call_args.args[1]
-        # Both since and until should appear as parsed datetimes in the param tuple.
+
+        # Both bounds made it into the WHERE clause
+        assert "c.started_at >= %s" in sql
+        assert "c.started_at <= %s" in sql
+
+        # Both datetimes appear in the param tuple, in chronological order
         dt_params = [p for p in params if isinstance(p, datetime)]
         assert len(dt_params) == 2
-        assert dt_params[0] < dt_params[1]
+        expected_since = datetime(2026, 4, 22, tzinfo=timezone.utc)
+        expected_until = datetime(2026, 4, 23, tzinfo=timezone.utc)
+        assert dt_params[0] == expected_since
+        assert dt_params[1] == expected_until
+
+
+def test_since_only_appends_only_lower_bound():
+    from utils.conversations.semantic_search import semantic_search_conversations
+
+    with patch("utils.conversations.semantic_search.embeddings") as emb_mock, \
+         patch("utils.conversations.semantic_search.db") as db_mock, \
+         patch("utils.conversations.semantic_search._decrypt_conversation_data", side_effect=lambda d, uid: d):
+        emb_mock.embed_query.return_value = [0.1] * 768
+        conn, cur = _mock_db_connection()
+        db_mock.connection.return_value = conn
+        cur.fetchall.return_value = []
+
+        semantic_search_conversations(
+            uid="james",
+            query="x",
+            since="2026-04-22T00:00:00Z",
+            limit=5,
+        )
+        sql = cur.execute.call_args.args[0]
+        params = cur.execute.call_args.args[1]
+
+        assert "c.started_at >= %s" in sql
+        assert "c.started_at <= %s" not in sql
+
+        dt_params = [p for p in params if isinstance(p, datetime)]
+        assert len(dt_params) == 1
+        assert dt_params[0] == datetime(2026, 4, 22, tzinfo=timezone.utc)
 
 
 def test_decryption_failure_yields_empty_excerpts_not_exception():
