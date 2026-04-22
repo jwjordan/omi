@@ -1,40 +1,43 @@
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-
-from google.cloud import firestore
+import json
+import logging
 
 from ._client import db
-import logging
 
 logger = logging.getLogger(__name__)
 
-SCREEN_ACTIVITY_COLLECTION = 'screen_activity'
-USERS_COLLECTION = 'users'
-
 
 def upsert_screen_activity(uid: str, rows: List[Dict[str, Any]]) -> int:
-    """Batch write screen activity rows to Firestore users/{uid}/screen_activity/{id}."""
+    """Batch write screen activity rows to Postgres users/{uid}/screen_activity/{id}."""
     if not rows:
         return 0
 
-    collection_ref = db.collection(USERS_COLLECTION).document(uid).collection(SCREEN_ACTIVITY_COLLECTION)
     written = 0
 
-    # Firestore batch limit is 500
+    # Process in batches of 500 (Firestore compat)
     for i in range(0, len(rows), 500):
         chunk = rows[i : i + 500]
-        batch = db.batch()
-        for row in chunk:
-            doc_id = str(row['id'])
-            doc_data = {
-                'timestamp': row['timestamp'],
-                'appName': row.get('appName', ''),
-                'windowTitle': row.get('windowTitle', ''),
-                'ocrText': (row.get('ocrText') or '')[:1000],
-            }
-            batch.set(collection_ref.document(doc_id), doc_data)
-        batch.commit()
-        written += len(chunk)
+        with db.batch() as conn:
+            with conn.cursor() as cur:
+                for row in chunk:
+                    doc_id = str(row['id'])
+                    doc_data = {
+                        'timestamp': row['timestamp'],
+                        'appName': row.get('appName', ''),
+                        'windowTitle': row.get('windowTitle', ''),
+                        'ocrText': (row.get('ocrText') or '')[:1000],
+                    }
+                    cur.execute(
+                        """
+                        INSERT INTO screen_activity (uid, id, data)
+                        VALUES (%s, %s, %s::jsonb)
+                        ON CONFLICT (uid, id) DO UPDATE
+                        SET data = EXCLUDED.data
+                        """,
+                        (uid, doc_id, json.dumps(doc_data)),
+                    )
+                written += len(chunk)
 
     return written
 
@@ -47,29 +50,43 @@ def get_screen_activity(
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """Query screen activity by date range with optional app filter."""
-    collection_ref = db.collection(USERS_COLLECTION).document(uid).collection(SCREEN_ACTIVITY_COLLECTION)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Build WHERE clause
+            where_parts = ["uid = %s"]
+            params = [uid]
 
-    query = collection_ref.order_by('timestamp', direction=firestore.Query.ASCENDING)
+            if start_date:
+                where_parts.append("created_at >= %s")
+                params.append(start_date)
+            if end_date:
+                where_parts.append("created_at <= %s")
+                params.append(end_date)
+            if app_filter:
+                where_parts.append("data->>'appName' = %s")
+                params.append(app_filter)
 
-    if start_date:
-        # Timestamps stored as 'YYYY-MM-DD HH:MM:SS.mmm' strings — must match format for comparison
-        ts = start_date.strftime('%Y-%m-%d %H:%M:%S.000') if isinstance(start_date, datetime) else start_date
-        query = query.where(filter=firestore.FieldFilter('timestamp', '>=', ts))
-    if end_date:
-        ts = end_date.strftime('%Y-%m-%d %H:%M:%S.999') if isinstance(end_date, datetime) else end_date
-        query = query.where(filter=firestore.FieldFilter('timestamp', '<=', ts))
-    if app_filter:
-        query = query.where(filter=firestore.FieldFilter('appName', '==', app_filter))
+            where_clause = " AND ".join(where_parts)
 
-    query = query.limit(limit)
+            # Build full query
+            sql = f"""
+                SELECT id, data
+                FROM screen_activity
+                WHERE {where_clause}
+                ORDER BY created_at ASC
+                LIMIT %s
+            """
+            params.append(limit)
 
-    results = []
-    for doc in query.stream():
-        data = doc.to_dict()
-        data['id'] = doc.id
-        results.append(data)
+            cur.execute(sql, params)
+            results = []
+            for row in cur.fetchall():
+                screen_id, row_data = row
+                result = dict(row_data or {})
+                result['id'] = screen_id
+                results.append(result)
 
-    return results
+            return results
 
 
 def get_screen_activity_summary(

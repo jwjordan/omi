@@ -20,14 +20,27 @@ sys.modules.setdefault("utils.stt.pre_recorded", MagicMock())
 # ─── Firestore Helpers ──────────────────────────────────────────────────────
 
 
+def _mock_pg_conn():
+    """Return (conn_mock, cursor_mock) with psycopg-style context-manager semantics."""
+    cursor_mock = MagicMock()
+    cursor_mock.__enter__ = MagicMock(return_value=cursor_mock)
+    cursor_mock.__exit__ = MagicMock(return_value=None)
+
+    conn_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    conn_mock.__enter__ = MagicMock(return_value=conn_mock)
+    conn_mock.__exit__ = MagicMock(return_value=None)
+    return conn_mock, cursor_mock
+
+
 class TestSetUserSpeakerEmbedding:
-    """Tests for database.users.set_user_speaker_embedding."""
+    """Tests for database.users.set_user_speaker_embedding (Postgres-backed)."""
 
     def test_stores_embedding_on_user_document(self):
-        """Should call update on the user document with embedding and timestamp."""
+        """Should upsert into users(data) JSONB with embedding + timestamp."""
         mock_db = MagicMock()
-        mock_user_ref = MagicMock()
-        mock_db.collection.return_value.document.return_value = mock_user_ref
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
 
         with patch('database.users.db', mock_db):
             from database.users import set_user_speaker_embedding
@@ -36,17 +49,21 @@ class TestSetUserSpeakerEmbedding:
             result = set_user_speaker_embedding('uid-123', embedding)
 
         assert result is True
-        mock_db.collection.assert_called_with('users')
-        mock_db.collection.return_value.document.assert_called_with('uid-123')
-        call_args = mock_user_ref.update.call_args[0][0]
-        assert call_args['speaker_embedding'] == [0.1, 0.2, 0.3, 0.4, 0.5]
-        assert 'speaker_embedding_updated_at' in call_args
+        sql = cur.execute.call_args.args[0]
+        params = cur.execute.call_args.args[1]
+        assert "INSERT INTO users" in sql
+        assert "ON CONFLICT (uid)" in sql
+        assert params[0] == 'uid-123'
+        # Embedding values and timestamp key must be inside the JSONB blob
+        assert "speaker_embedding" in params[1]
+        assert "0.1" in params[1]
+        assert "speaker_embedding_updated_at" in params[1]
 
     def test_stores_large_embedding(self):
         """Should handle 512-dim embeddings (production size)."""
         mock_db = MagicMock()
-        mock_user_ref = MagicMock()
-        mock_db.collection.return_value.document.return_value = mock_user_ref
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
 
         with patch('database.users.db', mock_db):
             from database.users import set_user_speaker_embedding
@@ -55,20 +72,23 @@ class TestSetUserSpeakerEmbedding:
             result = set_user_speaker_embedding('uid-456', embedding)
 
         assert result is True
-        stored = mock_user_ref.update.call_args[0][0]['speaker_embedding']
-        assert len(stored) == 512
+        params = cur.execute.call_args.args[1]
+        assert params[0] == 'uid-456'
+        # JSON-encoded list should carry all 512 elements
+        import json as _json
+        payload = _json.loads(params[1])
+        assert len(payload['speaker_embedding']) == 512
 
 
 class TestGetUserSpeakerEmbedding:
-    """Tests for database.users.get_user_speaker_embedding."""
+    """Tests for database.users.get_user_speaker_embedding (Postgres-backed)."""
 
     def test_returns_embedding_when_exists(self):
-        """Should return the embedding list when it exists on the user doc."""
+        """Should return the embedding list when it exists in users.data."""
         mock_db = MagicMock()
-        mock_doc = MagicMock()
-        mock_doc.exists = True
-        mock_doc.to_dict.return_value = {'speaker_embedding': [0.1, 0.2, 0.3]}
-        mock_db.collection.return_value.document.return_value.get.return_value = mock_doc
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
+        cur.fetchone.return_value = ({'speaker_embedding': [0.1, 0.2, 0.3]},)
 
         with patch('database.users.db', mock_db):
             from database.users import get_user_speaker_embedding
@@ -78,12 +98,11 @@ class TestGetUserSpeakerEmbedding:
         assert result == [0.1, 0.2, 0.3]
 
     def test_returns_none_when_no_embedding(self):
-        """Should return None when user has no speaker_embedding field."""
+        """Should return None when users.data has no speaker_embedding key."""
         mock_db = MagicMock()
-        mock_doc = MagicMock()
-        mock_doc.exists = True
-        mock_doc.to_dict.return_value = {'name': 'Test User'}
-        mock_db.collection.return_value.document.return_value.get.return_value = mock_doc
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
+        cur.fetchone.return_value = ({'name': 'Test User'},)
 
         with patch('database.users.db', mock_db):
             from database.users import get_user_speaker_embedding
@@ -93,11 +112,11 @@ class TestGetUserSpeakerEmbedding:
         assert result is None
 
     def test_returns_none_when_user_not_found(self):
-        """Should return None when user document doesn't exist."""
+        """Should return None when the users row doesn't exist."""
         mock_db = MagicMock()
-        mock_doc = MagicMock()
-        mock_doc.exists = False
-        mock_db.collection.return_value.document.return_value.get.return_value = mock_doc
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
+        cur.fetchone.return_value = None
 
         with patch('database.users.db', mock_db):
             from database.users import get_user_speaker_embedding
@@ -106,21 +125,18 @@ class TestGetUserSpeakerEmbedding:
 
         assert result is None
 
-    def test_returns_none_when_empty_list(self):
-        """Should return None when speaker_embedding is an empty list."""
+    def test_returns_empty_list_when_stored_empty(self):
+        """Empty list returned as-is — consumer treats falsy result as WAV fallback."""
         mock_db = MagicMock()
-        mock_doc = MagicMock()
-        mock_doc.exists = True
-        mock_doc.to_dict.return_value = {'speaker_embedding': []}
-        mock_db.collection.return_value.document.return_value.get.return_value = mock_doc
+        conn, cur = _mock_pg_conn()
+        mock_db.connection.return_value = conn
+        cur.fetchone.return_value = ({'speaker_embedding': []},)
 
         with patch('database.users.db', mock_db):
             from database.users import get_user_speaker_embedding
 
             result = get_user_speaker_embedding('uid-empty')
 
-        # Empty list is returned from Firestore — falsy, so speaker_identification_task
-        # treats it like None and triggers the WAV fallback extraction path
         assert result == []
 
 

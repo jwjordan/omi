@@ -1,53 +1,76 @@
+"""Action items. Postgres-backed port.
+
+Table: action_items (uid, id) PK
+  Typed columns: conversation_id, completed, created_at, updated_at
+  Everything else lives inside `data` JSONB (including sort_order,
+  indent_level, due_at, completed_at, sync_requested, exported,
+  export_platform, apple_reminder_id, is_locked, etc.).
+
+Indices: (uid, created_at DESC), (uid, conversation_id)
+"""
+
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
-from google.cloud import firestore
-from google.cloud.firestore_v1 import FieldFilter
-
 from ._client import db
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-# Collection name
-action_items_collection = 'action_items'
+def _ensure_timestamp(ts) -> Optional[datetime]:
+    """Ensure timestamp is a datetime object."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return None
 
 
-def _prepare_action_item_for_write(action_item_data: dict) -> dict:
-    """Prepare action item data for writing to database"""
-    # Ensure timestamps are properly formatted
-    if 'created_at' in action_item_data and action_item_data['created_at']:
-        if isinstance(action_item_data['created_at'], str):
-            action_item_data['created_at'] = datetime.fromisoformat(
-                action_item_data['created_at'].replace('Z', '+00:00')
-            )
+def _prepare_action_item_for_write(action_item_data: dict) -> tuple:
+    """
+    Prepare action item data for writing.
 
-    if 'updated_at' in action_item_data and action_item_data['updated_at']:
-        if isinstance(action_item_data['updated_at'], str):
-            action_item_data['updated_at'] = datetime.fromisoformat(
-                action_item_data['updated_at'].replace('Z', '+00:00')
-            )
+    Promotes id, conversation_id, completed, created_at to typed columns.
+    Returns (id, conversation_id, completed, created_at, rest_as_jsonb).
+    """
+    data = dict(action_item_data)  # shallow copy
 
-    if 'due_at' in action_item_data and action_item_data['due_at']:
-        if isinstance(action_item_data['due_at'], str):
-            action_item_data['due_at'] = datetime.fromisoformat(action_item_data['due_at'].replace('Z', '+00:00'))
+    # Extract typed columns, leave rest in JSONB
+    item_id = data.pop('id', None)
+    conversation_id = data.pop('conversation_id', None)
+    completed = data.pop('completed', False)
+    created_at = data.pop('created_at', None)
 
-    if 'completed_at' in action_item_data and action_item_data['completed_at']:
-        if isinstance(action_item_data['completed_at'], str):
-            action_item_data['completed_at'] = datetime.fromisoformat(
-                action_item_data['completed_at'].replace('Z', '+00:00')
-            )
+    # Ensure timestamps
+    created_at = _ensure_timestamp(created_at)
+    if created_at is None:
+        created_at = datetime.now(timezone.utc)
 
-    return action_item_data
+    # Convert datetime objects to ISO strings for JSON serialization
+    for field in ['updated_at', 'due_at', 'completed_at']:
+        if field in data and data[field]:
+            ts = _ensure_timestamp(data[field])
+            if ts:
+                data[field] = ts.isoformat()
+
+    return item_id, conversation_id, completed, created_at, data
 
 
-def _prepare_action_item_for_read(action_item_data: dict) -> dict:
-    """Prepare action item data for reading from database"""
-    for field in ['created_at', 'updated_at', 'due_at', 'completed_at']:
-        if field in action_item_data and action_item_data[field]:
-            if hasattr(action_item_data[field], 'timestamp'):
-                action_item_data[field] = datetime.fromtimestamp(action_item_data[field].timestamp(), tz=timezone.utc)
-    return action_item_data
+def _prepare_action_item_for_read(row: tuple) -> dict:
+    """
+    Reconstruct action item from DB row (id, conversation_id, completed, created_at, updated_at, data).
+    """
+    item_id, conversation_id, completed, created_at, updated_at, data = row
+    result = dict(data or {})
+    result['id'] = item_id
+    result['conversation_id'] = conversation_id
+    result['completed'] = completed
+    result['created_at'] = created_at
+    result['updated_at'] = updated_at
+    return result
 
 
 # *****************************
@@ -66,23 +89,40 @@ def create_action_item(uid: str, action_item_data: dict) -> str:
     Returns:
         The ID of the created action item
     """
-    action_item_data = _prepare_action_item_for_write(action_item_data)
+    import uuid
+    item_id, conversation_id, completed, created_at, rest_data = _prepare_action_item_for_write(
+        action_item_data
+    )
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
+    # Generate ID if not provided
+    if not item_id:
+        item_id = str(uuid.uuid4())
 
-    if 'created_at' not in action_item_data:
-        action_item_data['created_at'] = datetime.now(timezone.utc)
-    if 'updated_at' not in action_item_data:
-        action_item_data['updated_at'] = datetime.now(timezone.utc)
+    # Set timestamps
+    if created_at is None:
+        created_at = datetime.now(timezone.utc)
+    updated_at = datetime.now(timezone.utc)
 
-    # Set completed_at if the item is being created as completed
-    if action_item_data.get('completed', False) and 'completed_at' not in action_item_data:
-        action_item_data['completed_at'] = datetime.now(timezone.utc)
+    # Set completed_at if being created as completed
+    if completed and 'completed_at' not in rest_data:
+        rest_data['completed_at'] = updated_at.isoformat()
 
-    doc_ref = action_items_ref.add(action_item_data)[1]
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO action_items (uid, id, conversation_id, completed, created_at, updated_at, data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (uid, id) DO UPDATE
+                    SET conversation_id = EXCLUDED.conversation_id,
+                        completed = EXCLUDED.completed,
+                        updated_at = EXCLUDED.updated_at,
+                        data = EXCLUDED.data
+                """,
+                (uid, item_id, conversation_id, completed, created_at, updated_at, json.dumps(rest_data)),
+            )
 
-    return doc_ref.id
+    return item_id
 
 
 def create_action_items_batch(uid: str, action_items_data: List[dict]) -> List[str]:
@@ -96,35 +136,48 @@ def create_action_items_batch(uid: str, action_items_data: List[dict]) -> List[s
     Returns:
         List of created action item IDs
     """
+    import uuid
     if not action_items_data:
         return []
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
+    item_ids = []
+    now = datetime.now(timezone.utc)
 
-    batch = db.batch()
-    doc_refs = []
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for action_item_data in action_items_data:
+                item_id, conversation_id, completed, created_at, rest_data = _prepare_action_item_for_write(
+                    action_item_data
+                )
 
-    for action_item_data in action_items_data:
-        action_item_data = _prepare_action_item_for_write(action_item_data)
+                # Generate ID if not provided
+                if not item_id:
+                    item_id = str(uuid.uuid4())
 
-        if 'created_at' not in action_item_data:
-            action_item_data['created_at'] = datetime.now(timezone.utc)
-        if 'updated_at' not in action_item_data:
-            action_item_data['updated_at'] = datetime.now(timezone.utc)
+                # Set timestamps
+                if created_at is None:
+                    created_at = now
+                updated_at = now
 
-        # Set completed_at if the item is being created as completed
-        if action_item_data.get('completed', False) and 'completed_at' not in action_item_data:
-            action_item_data['completed_at'] = datetime.now(timezone.utc)
+                # Set completed_at if being created as completed
+                if completed and 'completed_at' not in rest_data:
+                    rest_data['completed_at'] = updated_at
 
-        doc_ref = action_items_ref.document()
-        batch.set(doc_ref, action_item_data)
-        doc_refs.append(doc_ref.id)
+                cur.execute(
+                    """
+                    INSERT INTO action_items (uid, id, conversation_id, completed, created_at, updated_at, data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (uid, id) DO UPDATE
+                        SET conversation_id = EXCLUDED.conversation_id,
+                            completed = EXCLUDED.completed,
+                            updated_at = EXCLUDED.updated_at,
+                            data = EXCLUDED.data
+                    """,
+                    (uid, item_id, conversation_id, completed, created_at, updated_at, json.dumps(rest_data)),
+                )
+                item_ids.append(item_id)
 
-    # Commit batch
-    batch.commit()
-
-    return doc_refs
+    return item_ids
 
 
 # *****************************
@@ -143,16 +196,20 @@ def get_action_item(uid: str, action_item_id: str) -> Optional[dict]:
     Returns:
         Action item data or None if not found
     """
-    user_ref = db.collection('users').document(uid)
-    action_item_ref = user_ref.collection(action_items_collection).document(action_item_id)
-    doc = action_item_ref.get()
-
-    if not doc.exists:
-        return None
-
-    data = doc.to_dict()
-    data['id'] = doc.id
-    return _prepare_action_item_for_read(data)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, conversation_id, completed, created_at, updated_at, data
+                FROM action_items
+                WHERE uid = %s AND id = %s
+                """,
+                (uid, action_item_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return _prepare_action_item_for_read(row)
 
 
 def get_action_items(
@@ -171,70 +228,77 @@ def get_action_items(
 
     Args:
         uid: User ID
-        conversation_id: Filter by conversation ID (None for standalone items)
+        conversation_id: Filter by conversation ID
         completed: Filter by completion status
-        start_date: Filter by created_at start date (inclusive) - applied at database level
-        end_date: Filter by created_at end date (inclusive) - applied at database level
-        due_start_date: Filter by due_at start date (inclusive) - applied at database level
-        due_end_date: Filter by due_at end date (inclusive) - applied at database level
+        start_date: Filter by created_at start date (inclusive)
+        end_date: Filter by created_at end date (inclusive)
+        due_start_date: Filter by due_at start date (inclusive) - in data JSONB
+        due_end_date: Filter by due_at end date (inclusive) - in data JSONB
         limit: Maximum number of items to return
         offset: Number of items to skip
 
     Returns:
         List of action items
-
-    Note:
-        If both created_at and due_at filters are provided, only due_at filters will be applied
-        (due to Firestore limitation requiring inequality filters on same field as orderBy).
     """
-    user_ref = db.collection('users').document(uid)
-    query = user_ref.collection(action_items_collection)
+    # Build WHERE clause dynamically
+    where_clauses = ["uid = %s"]
+    params = [uid]
 
-    # Apply filters
     if conversation_id is not None:
-        query = query.where(filter=FieldFilter('conversation_id', '==', conversation_id))
-    elif conversation_id is None and completed is None:
-        pass
+        where_clauses.append("conversation_id = %s")
+        params.append(conversation_id)
 
     if completed is not None:
-        query = query.where(filter=FieldFilter('completed', '==', completed))
+        where_clauses.append("completed = %s")
+        params.append(completed)
 
-    # Determine which date field to use for database-level filtering and ordering
-    # Priority: due_at filters if present, otherwise created_at filters
-    # This is necessary because Firestore requires inequality filters to be on the same field as orderBy
+    if start_date is not None:
+        where_clauses.append("created_at >= %s")
+        params.append(start_date)
+
+    if end_date is not None:
+        where_clauses.append("created_at <= %s")
+        params.append(end_date)
+
+    # due_at filtering on JSONB data
+    if due_start_date is not None:
+        where_clauses.append("(data->>'due_at')::timestamptz >= %s")
+        params.append(due_start_date)
+
+    if due_end_date is not None:
+        where_clauses.append("(data->>'due_at')::timestamptz <= %s")
+        params.append(due_end_date)
+
+    where_sql = " AND ".join(where_clauses)
+
+    # Determine ORDER BY based on whether due_at filtering is active
     due_at_filtering = due_start_date is not None or due_end_date is not None
     if due_at_filtering:
-        if due_start_date is not None:
-            query = query.where(filter=FieldFilter('due_at', '>=', due_start_date))
-        if due_end_date is not None:
-            query = query.where(filter=FieldFilter('due_at', '<=', due_end_date))
-
-        query = query.order_by('due_at', direction=firestore.Query.DESCENDING)
+        order_by = "ORDER BY (data->>'due_at')::timestamptz DESC NULLS LAST"
     else:
-        if start_date is not None:
-            query = query.where(filter=FieldFilter('created_at', '>=', start_date))
-        if end_date is not None:
-            query = query.where(filter=FieldFilter('created_at', '<=', end_date))
+        order_by = "ORDER BY created_at DESC"
 
-        query = query.order_by('created_at', direction=firestore.Query.DESCENDING)
+    sql = f"""
+        SELECT id, conversation_id, completed, created_at, updated_at, data
+        FROM action_items
+        WHERE {where_sql}
+        {order_by}
+        OFFSET %s
+    """
+    params.append(offset)
 
-    # Apply pagination
-    if offset > 0:
-        query = query.offset(offset)
-    if limit:
-        query = query.limit(limit)
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
 
-    # Execute query
-    docs = query.stream()
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
 
-    action_items = []
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        action_item = _prepare_action_item_for_read(data)
-        action_items.append(action_item)
+    action_items = [_prepare_action_item_for_read(row) for row in rows]
 
-    # Sort results by due_at first (items without due_at come last), then by created_at
+    # Apply client-side sorting: due_at first (nulls last), then created_at DESC
     action_items.sort(
         key=lambda x: (
             x.get('due_at') is None,
@@ -262,7 +326,7 @@ def get_action_items_by_conversation(uid: str, conversation_id: str) -> List[dic
 
 def get_action_items_by_ids(uid: str, action_item_ids: List[str]) -> List[dict]:
     """
-    Get multiple action items by their IDs in a single batch operation.
+    Get multiple action items by their IDs.
 
     Args:
         uid: User ID
@@ -274,21 +338,26 @@ def get_action_items_by_ids(uid: str, action_item_ids: List[str]) -> List[dict]:
     if not action_item_ids:
         return []
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
-
-    # Firestore batch get operation
-    doc_refs = [action_items_ref.document(item_id) for item_id in action_item_ids]
-    docs = db.get_all(doc_refs)
-
-    # Create a map to preserve order
+    # Create action_items_map to preserve order
     action_items_map = {}
-    for doc in docs:
-        if doc.exists:
-            data = doc.to_dict()
-            data['id'] = doc.id
-            action_item = _prepare_action_item_for_read(data)
-            action_items_map[doc.id] = action_item
+
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Use IN for multiple IDs
+            placeholders = ",".join(["%s"] * len(action_item_ids))
+            cur.execute(
+                f"""
+                SELECT id, conversation_id, completed, created_at, updated_at, data
+                FROM action_items
+                WHERE uid = %s AND id IN ({placeholders})
+                """,
+                [uid] + action_item_ids,
+            )
+            rows = cur.fetchall()
+
+    for row in rows:
+        action_item = _prepare_action_item_for_read(row)
+        action_items_map[action_item['id']] = action_item
 
     # Return in the same order as input IDs
     action_items = []
@@ -316,21 +385,39 @@ def update_action_item(uid: str, action_item_id: str, update_data: dict) -> bool
     Returns:
         True if updated successfully, False otherwise
     """
-    # Prepare data
-    update_data = _prepare_action_item_for_write(update_data)
+    item_id, conversation_id, completed, created_at, rest_data = _prepare_action_item_for_write(update_data)
 
-    user_ref = db.collection('users').document(uid)
-    action_item_ref = user_ref.collection(action_items_collection).document(action_item_id)
+    now = datetime.now(timezone.utc)
 
-    # Check if exists
-    if not action_item_ref.get().exists:
-        return False
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Check if exists
+            cur.execute(
+                "SELECT 1 FROM action_items WHERE uid = %s AND id = %s",
+                (uid, action_item_id),
+            )
+            if cur.fetchone() is None:
+                return False
 
-    # Add updated timestamp
-    update_data['updated_at'] = datetime.now(timezone.utc)
-
-    # Update the document
-    action_item_ref.update(update_data)
+            # Update with typed column promotion
+            cur.execute(
+                """
+                UPDATE action_items
+                SET data = data || %s::jsonb,
+                    completed = COALESCE(%s, completed),
+                    conversation_id = COALESCE(%s, conversation_id),
+                    updated_at = %s
+                WHERE uid = %s AND id = %s
+                """,
+                (
+                    json.dumps(rest_data),
+                    completed if 'completed' in update_data else None,
+                    conversation_id,
+                    now,
+                    uid,
+                    action_item_id,
+                ),
+            )
 
     return True
 
@@ -346,32 +433,27 @@ def batch_update_action_items(uid: str, items: list) -> None:
     if not items:
         return
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
     now = datetime.now(timezone.utc)
 
-    batch = db.batch()
-    count = 0
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for item in items:
+                update_data = {}
+                if hasattr(item, 'sort_order') and item.sort_order is not None:
+                    update_data['sort_order'] = item.sort_order
+                if hasattr(item, 'indent_level') and item.indent_level is not None:
+                    update_data['indent_level'] = item.indent_level
 
-    for item in items:
-        update_data = {'updated_at': now}
-        if item.sort_order is not None:
-            update_data['sort_order'] = item.sort_order
-        if item.indent_level is not None:
-            update_data['indent_level'] = item.indent_level
-
-        if len(update_data) > 1:  # More than just updated_at
-            doc_ref = action_items_ref.document(item.id)
-            batch.update(doc_ref, update_data)
-            count += 1
-
-        if count >= 499:  # Firestore batch limit is 500
-            batch.commit()
-            batch = db.batch()
-            count = 0
-
-    if count > 0:
-        batch.commit()
+                if update_data:  # Only update if there are fields to update
+                    cur.execute(
+                        """
+                        UPDATE action_items
+                        SET data = data || %s::jsonb,
+                            updated_at = %s
+                        WHERE uid = %s AND id = %s
+                        """,
+                        (json.dumps(update_data), now, uid, item.id),
+                    )
 
 
 def mark_action_item_completed(uid: str, action_item_id: str, completed: bool = True) -> bool:
@@ -386,7 +468,10 @@ def mark_action_item_completed(uid: str, action_item_id: str, completed: bool = 
     Returns:
         True if updated successfully, False otherwise
     """
-    update_data = {'completed': completed, 'completed_at': datetime.now(timezone.utc) if completed else None}
+    update_data = {
+        'completed': completed,
+        'completed_at': datetime.now(timezone.utc) if completed else None
+    }
     return update_action_item(uid, action_item_id, update_data)
 
 
@@ -406,17 +491,13 @@ def delete_action_item(uid: str, action_item_id: str) -> bool:
     Returns:
         True if deleted successfully, False otherwise
     """
-    user_ref = db.collection('users').document(uid)
-    action_item_ref = user_ref.collection(action_items_collection).document(action_item_id)
-
-    # Check if exists
-    if not action_item_ref.get().exists:
-        return False
-
-    # Delete the document
-    action_item_ref.delete()
-
-    return True
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM action_items WHERE uid = %s AND id = %s",
+                (uid, action_item_id),
+            )
+            return cur.rowcount > 0
 
 
 def delete_action_items_for_conversation(uid: str, conversation_id: str) -> int:
@@ -430,23 +511,13 @@ def delete_action_items_for_conversation(uid: str, conversation_id: str) -> int:
     Returns:
         Number of deleted items
     """
-    user_ref = db.collection('users').document(uid)
-    query = user_ref.collection(action_items_collection).where(
-        filter=FieldFilter('conversation_id', '==', conversation_id)
-    )
-
-    docs = query.stream()
-    batch = db.batch()
-    count = 0
-
-    for doc in docs:
-        batch.delete(doc.reference)
-        count += 1
-
-    if count > 0:
-        batch.commit()
-
-    return count
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM action_items WHERE uid = %s AND conversation_id = %s",
+                (uid, conversation_id),
+            )
+            return cur.rowcount
 
 
 # *****************************
@@ -459,61 +530,73 @@ def batch_set_sync_requested(uid: str, item_ids: List[str]) -> None:
     if not item_ids:
         return
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
     now = datetime.now(timezone.utc)
 
-    batch = db.batch()
-    for item_id in item_ids:
-        doc_ref = action_items_ref.document(item_id)
-        batch.update(doc_ref, {'sync_requested': True, 'updated_at': now})
-
-    batch.commit()
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for item_id in item_ids:
+                cur.execute(
+                    """
+                    UPDATE action_items
+                    SET data = data || %s::jsonb,
+                        updated_at = %s
+                    WHERE uid = %s AND id = %s
+                    """,
+                    (json.dumps({'sync_requested': True}), now, uid, item_id),
+                )
 
 
 def get_pending_apple_reminders_sync(uid: str) -> dict:
     """
     Get items needing Apple Reminders sync:
-    - pending_export: sync_requested=True but not yet exported (FCM missed items)
-    - synced_items: exported to apple_reminders with apple_reminder_id (for bidirectional sync)
+    - pending_export: sync_requested=True but not yet exported
+    - synced_items: exported to apple_reminders with apple_reminder_id
     """
-    user_ref = db.collection('users').document(uid)
-    items_ref = user_ref.collection(action_items_collection)
-
-    # Pending export: sync_requested=True, filter exported!=True in Python
-    # (avoids composite index + handles missing 'exported' field)
-    pending_query = items_ref.where(filter=FieldFilter('sync_requested', '==', True)).limit(50)
-    pending_docs = pending_query.stream()
     pending_export = []
-    for doc in pending_docs:
-        data = doc.to_dict()
-        if data.get('exported') is True:
-            continue
-        data['id'] = doc.id
-        pending_export.append(_prepare_action_item_for_read(data))
-
-    # Synced items: exported to apple_reminders (for bidirectional sync)
-    # Uses only equality filters to avoid composite index requirement
-    synced_query = (
-        items_ref.where(filter=FieldFilter('export_platform', '==', 'apple_reminders'))
-        .where(filter=FieldFilter('exported', '==', True))
-        .limit(100)
-    )
-    synced_docs = synced_query.stream()
     synced_items = []
-    for doc in synced_docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        synced_items.append(_prepare_action_item_for_read(data))
-    # Sort by updated_at desc in Python instead of Firestore (avoids composite index)
-    synced_items.sort(key=lambda x: x.get('updated_at') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Pending export: sync_requested=True, exported != True
+            cur.execute(
+                """
+                SELECT id, conversation_id, completed, created_at, updated_at, data
+                FROM action_items
+                WHERE uid = %s AND (data->>'sync_requested')::boolean = true
+                LIMIT 50
+                """,
+                (uid,),
+            )
+            for row in cur.fetchall():
+                action_item = _prepare_action_item_for_read(row)
+                # Filter out already exported items in Python
+                if action_item.get('data', {}).get('exported') is not True:
+                    pending_export.append(action_item)
+
+            # Synced items: exported to apple_reminders
+            cur.execute(
+                """
+                SELECT id, conversation_id, completed, created_at, updated_at, data
+                FROM action_items
+                WHERE uid = %s AND data->>'export_platform' = %s AND (data->>'exported')::boolean = true
+                LIMIT 100
+                """,
+                (uid, 'apple_reminders'),
+            )
+            synced_items = [_prepare_action_item_for_read(row) for row in cur.fetchall()]
+
+    # Sort by updated_at desc
+    synced_items.sort(
+        key=lambda x: x.get('updated_at') or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True
+    )
 
     return {"pending_export": pending_export, "synced_items": synced_items}
 
 
 def batch_sync_update_action_items(uid: str, updates: List[dict]) -> None:
     """
-    Batch update action items during reminders sync. Single Firestore batch commit.
+    Batch update action items during reminders sync.
 
     Args:
         uid: User ID
@@ -522,52 +605,49 @@ def batch_sync_update_action_items(uid: str, updates: List[dict]) -> None:
     if not updates:
         return
 
-    user_ref = db.collection('users').document(uid)
-    action_items_ref = user_ref.collection(action_items_collection)
     now = datetime.now(timezone.utc)
 
-    batch = db.batch()
-    count = 0
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for entry in updates:
+                item_id, _, _, _, rest_data = _prepare_action_item_for_write(entry['data'])
+                # rest_data already has timestamps serialized by _prepare_action_item_for_write
 
-    for entry in updates:
-        update_data = _prepare_action_item_for_write(entry['data'])
-        update_data['updated_at'] = now
-        # Clear sync_requested when item is successfully exported
-        if update_data.get('exported') is True:
-            update_data['sync_requested'] = False
-        doc_ref = action_items_ref.document(entry['id'])
-        batch.update(doc_ref, update_data)
-        count += 1
+                # Clear sync_requested when item is successfully exported
+                if rest_data.get('exported') is True:
+                    rest_data['sync_requested'] = False
 
-        if count >= 499:
-            batch.commit()
-            batch = db.batch()
-            count = 0
-
-    if count > 0:
-        batch.commit()
+                cur.execute(
+                    """
+                    UPDATE action_items
+                    SET data = data || %s::jsonb,
+                        updated_at = %s
+                    WHERE uid = %s AND id = %s
+                    """,
+                    (json.dumps(rest_data), now, uid, item_id),
+                )
 
 
 def unlock_all_action_items(uid: str):
     """
     Finds all action items for a user with is_locked: True and updates them to is_locked = False.
     """
-    action_items_ref = db.collection('users').document(uid).collection(action_items_collection)
-    locked_items_query = action_items_ref.where(filter=FieldFilter('is_locked', '==', True))
+    now = datetime.now(timezone.utc)
 
-    batch = db.batch()
-    docs = locked_items_query.stream()
-    count = 0
-    for doc in docs:
-        batch.update(doc.reference, {'is_locked': False})
-        count += 1
-        if count >= 499:  # Firestore batch limit is 500
-            batch.commit()
-            batch = db.batch()
-            count = 0
-    if count > 0:
-        batch.commit()
-    logger.info(f"Unlocked all action items for user {uid}")
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE action_items
+                SET data = data || %s::jsonb,
+                    updated_at = %s
+                WHERE uid = %s AND (data->>'is_locked')::boolean = true
+                """,
+                (json.dumps({'is_locked': False}), now, uid),
+            )
+            count = cur.rowcount
+
+    logger.info(f"Unlocked {count} action items for user {uid}")
 
 
 # ============================================================================
@@ -583,26 +663,36 @@ def get_daily_score(uid: str, date: str = None) -> dict:
         day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
     day_end = day + timedelta(days=1)
-    col = db.collection('users').document(uid).collection(action_items_collection)
 
-    # Count tasks due today
-    due_query = col.where(filter=FieldFilter('due_at', '>=', day)).where(filter=FieldFilter('due_at', '<', day_end))
-    total = 0
-    completed = 0
-    for doc in due_query.stream():
-        data = doc.to_dict()
-        if data.get('deleted'):
-            continue
-        total += 1
-        if data.get('completed'):
-            completed += 1
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Count tasks due today, excluding deleted ones
+            cur.execute(
+                """
+                SELECT COUNT(*) as total, SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed
+                FROM action_items
+                WHERE uid = %s
+                  AND (data->>'due_at')::timestamptz >= %s
+                  AND (data->>'due_at')::timestamptz < %s
+                  AND (data->>'deleted')::boolean IS NOT TRUE
+                """,
+                (uid, day, day_end),
+            )
+            row = cur.fetchone()
+            total = row[0] or 0
+            completed = row[1] or 0
 
     score = round((completed / total * 100) if total > 0 else 0)
-    return {'date': day.strftime('%Y-%m-%d'), 'score': score, 'completed_tasks': completed, 'total_tasks': total}
+    return {
+        'date': day.strftime('%Y-%m-%d'),
+        'score': score,
+        'completed_tasks': completed,
+        'total_tasks': total
+    }
 
 
 def get_scores(uid: str, date: str = None) -> dict:
-    """Compute daily, weekly, and overall scores (matching Rust backend behavior).
+    """Compute daily, weekly, and overall scores.
 
     Takes a single date (or defaults to today) and returns:
       daily  — tasks due on that date
@@ -618,44 +708,56 @@ def get_scores(uid: str, date: str = None) -> dict:
     day_end = day + timedelta(days=1)
     week_start = day - timedelta(days=7)
 
-    col = db.collection('users').document(uid).collection(action_items_collection)
-
     def _score(completed, total):
         return round((completed / total * 100) if total > 0 else 0, 1)
 
-    # Daily: tasks due today
-    daily_q = col.where(filter=FieldFilter('due_at', '>=', day_start)).where(filter=FieldFilter('due_at', '<', day_end))
-    daily_completed = daily_total = 0
-    for doc in daily_q.stream():
-        data = doc.to_dict()
-        if data.get('deleted'):
-            continue
-        daily_total += 1
-        if data.get('completed'):
-            daily_completed += 1
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Daily: tasks due today
+            cur.execute(
+                """
+                SELECT COUNT(*) as total, SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed
+                FROM action_items
+                WHERE uid = %s
+                  AND (data->>'due_at')::timestamptz >= %s
+                  AND (data->>'due_at')::timestamptz < %s
+                  AND (data->>'deleted')::boolean IS NOT TRUE
+                """,
+                (uid, day_start, day_end),
+            )
+            row = cur.fetchone()
+            daily_total = row[0] or 0
+            daily_completed = row[1] or 0
 
-    # Weekly: tasks created in last 7 days (matches Rust backend which uses created_at)
-    weekly_q = col.where(filter=FieldFilter('created_at', '>=', week_start)).where(
-        filter=FieldFilter('created_at', '<', day_end)
-    )
-    weekly_completed = weekly_total = 0
-    for doc in weekly_q.stream():
-        data = doc.to_dict()
-        if data.get('deleted'):
-            continue
-        weekly_total += 1
-        if data.get('completed'):
-            weekly_completed += 1
+            # Weekly: tasks created in last 7 days
+            cur.execute(
+                """
+                SELECT COUNT(*) as total, SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed
+                FROM action_items
+                WHERE uid = %s
+                  AND created_at >= %s
+                  AND created_at < %s
+                  AND (data->>'deleted')::boolean IS NOT TRUE
+                """,
+                (uid, week_start, day_end),
+            )
+            row = cur.fetchone()
+            weekly_total = row[0] or 0
+            weekly_completed = row[1] or 0
 
-    # Overall: all non-deleted tasks
-    overall_completed = overall_total = 0
-    for doc in col.stream():
-        data = doc.to_dict()
-        if data.get('deleted'):
-            continue
-        overall_total += 1
-        if data.get('completed'):
-            overall_completed += 1
+            # Overall: all non-deleted tasks
+            cur.execute(
+                """
+                SELECT COUNT(*) as total, SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed
+                FROM action_items
+                WHERE uid = %s
+                  AND (data->>'deleted')::boolean IS NOT TRUE
+                """,
+                (uid,),
+            )
+            row = cur.fetchone()
+            overall_total = row[0] or 0
+            overall_completed = row[1] or 0
 
     daily = {
         'score': _score(daily_completed, daily_total),

@@ -1,14 +1,23 @@
 """
-Database operations for Wrapped (yearly recap) stored in users/{uid}/wrapped/{year}.
+Database operations for Wrapped (yearly recap) stored in wrapped table.
+
+Table: wrapped (per-user, keyed by uid + id)
+    uid TEXT NOT NULL
+    id TEXT NOT NULL       -- year as string, e.g. '2026'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    data JSONB NOT NULL DEFAULT '{}'::jsonb
+    PRIMARY KEY (uid, id)
+
+The year is stored as a string in the id column; all other data
+(status, started_at, updated_at, completed_at, result, error, progress, schema_version)
+lives in the data JSONB column.
 """
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
 from ._client import db
-
-# Collection name under user document
-WRAPPED_COLLECTION = 'wrapped'
 
 
 class WrappedStatus:
@@ -29,22 +38,19 @@ def get_wrapped(uid: str, year: int) -> Optional[dict]:
     Returns:
         Wrapped document data or None if not found
     """
-    user_ref = db.collection('users').document(uid)
-    wrapped_ref = user_ref.collection(WRAPPED_COLLECTION).document(str(year))
-    doc = wrapped_ref.get()
-
-    if not doc.exists:
-        return None
-
-    data = doc.to_dict()
-
-    # Convert Firestore timestamps to datetime objects
-    for field in ['started_at', 'completed_at', 'updated_at']:
-        if field in data and data[field]:
-            if hasattr(data[field], 'timestamp'):
-                data[field] = datetime.fromtimestamp(data[field].timestamp(), tz=timezone.utc)
-
-    return data
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT data FROM wrapped
+                WHERE uid = %s AND id = %s
+                """,
+                (uid, str(year)),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return row[0] or {}
 
 
 def create_wrapped(uid: str, year: int) -> dict:
@@ -62,17 +68,25 @@ def create_wrapped(uid: str, year: int) -> dict:
     wrapped_data = {
         'year': year,
         'status': WrappedStatus.PROCESSING,
-        'started_at': now,
-        'updated_at': now,
+        'started_at': now.isoformat(),
+        'updated_at': now.isoformat(),
         'completed_at': None,
         'result': None,
         'error': None,
         'schema_version': 1,
     }
 
-    user_ref = db.collection('users').document(uid)
-    wrapped_ref = user_ref.collection(WRAPPED_COLLECTION).document(str(year))
-    wrapped_ref.set(wrapped_data)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO wrapped (uid, id, data)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (uid, id) DO UPDATE
+                    SET data = EXCLUDED.data
+                """,
+                (uid, str(year), json.dumps(wrapped_data)),
+            )
 
     return wrapped_data
 
@@ -97,28 +111,31 @@ def update_wrapped_status(
     Returns:
         True if updated successfully
     """
-    user_ref = db.collection('users').document(uid)
-    wrapped_ref = user_ref.collection(WRAPPED_COLLECTION).document(str(year))
-
-    if not wrapped_ref.get().exists:
-        return False
-
     now = datetime.now(timezone.utc)
-    update_data = {
+    update_dict = {
         'status': status,
-        'updated_at': now,
+        'updated_at': now.isoformat(),
     }
 
     if status == WrappedStatus.DONE:
-        update_data['completed_at'] = now
-        update_data['result'] = result
-        update_data['error'] = None
+        update_dict['completed_at'] = now.isoformat()
+        update_dict['result'] = result
+        update_dict['error'] = None
     elif status == WrappedStatus.ERROR:
-        update_data['error'] = error
-        update_data['result'] = None
+        update_dict['error'] = error
+        update_dict['result'] = None
 
-    wrapped_ref.update(update_data)
-    return True
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE wrapped
+                SET data = data || %s::jsonb
+                WHERE uid=%s AND id=%s
+                """,
+                (json.dumps(update_dict), uid, str(year)),
+            )
+            return cur.rowcount > 0
 
 
 def update_wrapped_progress(uid: str, year: int, progress: dict) -> bool:
@@ -133,19 +150,22 @@ def update_wrapped_progress(uid: str, year: int, progress: dict) -> bool:
     Returns:
         True if updated successfully
     """
-    user_ref = db.collection('users').document(uid)
-    wrapped_ref = user_ref.collection(WRAPPED_COLLECTION).document(str(year))
+    update_dict = {
+        'progress': progress,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
 
-    if not wrapped_ref.get().exists:
-        return False
-
-    wrapped_ref.update(
-        {
-            'progress': progress,
-            'updated_at': datetime.now(timezone.utc),
-        }
-    )
-    return True
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE wrapped
+                SET data = data || %s::jsonb
+                WHERE uid=%s AND id=%s
+                """,
+                (json.dumps(update_dict), uid, str(year)),
+            )
+            return cur.rowcount > 0
 
 
 def reset_wrapped_for_regeneration(uid: str, year: int) -> dict:
@@ -163,8 +183,8 @@ def reset_wrapped_for_regeneration(uid: str, year: int) -> dict:
     wrapped_data = {
         'year': year,
         'status': WrappedStatus.PROCESSING,
-        'started_at': now,
-        'updated_at': now,
+        'started_at': now.isoformat(),
+        'updated_at': now.isoformat(),
         'completed_at': None,
         'result': None,
         'error': None,
@@ -172,9 +192,17 @@ def reset_wrapped_for_regeneration(uid: str, year: int) -> dict:
         'schema_version': 1,
     }
 
-    user_ref = db.collection('users').document(uid)
-    wrapped_ref = user_ref.collection(WRAPPED_COLLECTION).document(str(year))
-    wrapped_ref.set(wrapped_data)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO wrapped (uid, id, data)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (uid, id) DO UPDATE
+                    SET data = EXCLUDED.data
+                """,
+                (uid, str(year), json.dumps(wrapped_data)),
+            )
 
     return wrapped_data
 
@@ -198,7 +226,9 @@ def is_wrapped_stuck(wrapped_data: dict, stale_minutes: int = 15) -> bool:
         return True
 
     # Ensure updated_at is a datetime
-    if hasattr(updated_at, 'timestamp'):
+    if isinstance(updated_at, str):
+        updated_at = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+    elif hasattr(updated_at, 'timestamp'):
         updated_at = datetime.fromtimestamp(updated_at.timestamp(), tz=timezone.utc)
     elif updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)

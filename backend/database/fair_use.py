@@ -1,36 +1,18 @@
-"""Firestore CRUD for fair-use tracking.
+"""Postgres CRUD for fair-use tracking.
 
-Required Firestore composite indexes (create before deploying):
+Two tables:
+  - fair_use_state (uid TEXT PRIMARY KEY): singleton per user, stores stage/counts/metadata
+  - fair_use_events (uid, id PRIMARY KEY): many per user, stores violation events
 
-1. Collection group: fair_use_state
-   Fields: stage (Ascending), updated_at (Descending)
-   Scope: Collection group
-   Used by: get_flagged_users() — admin dashboard
-
-2. Collection group: fair_use_events
-   Fields: case_ref (Ascending)
-   Scope: Collection group
-   Used by: lookup_case(), get_public_case_status() — case reference lookup
-
-Create via gcloud:
-  gcloud firestore indexes composite create --project=<PROJECT> \\
-    --collection-group=fair_use_state \\
-    --query-scope=collection-group \\
-    --field-config=field-path=stage,order=ascending \\
-    --field-config=field-path=updated_at,order=descending
-
-  gcloud firestore indexes composite create --project=<PROJECT> \\
-    --collection-group=fair_use_events \\
-    --query-scope=collection-group \\
-    --field-config=field-path=case_ref,order=ascending
+Required indexes:
+  - fair_use_state: none beyond PK
+  - fair_use_events: (uid, created_at DESC), (uid, resolved)
 """
 
 import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
-
-from google.cloud import firestore
 
 from ._client import db
 
@@ -44,18 +26,31 @@ logger = logging.getLogger(__name__)
 
 def get_fair_use_state(uid: str) -> dict:
     """Get the current fair-use enforcement state for a user."""
-    ref = db.collection('users').document(uid).collection('fair_use_state').document('current')
-    doc = ref.get()
-    if doc.exists:
-        return doc.to_dict()
-    return {}
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM fair_use_state WHERE uid = %s",
+                (uid,)
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            return {}
 
 
 def update_fair_use_state(uid: str, updates: dict) -> None:
     """Update fair-use state atomically."""
-    ref = db.collection('users').document(uid).collection('fair_use_state').document('current')
     updates['updated_at'] = datetime.utcnow()
-    ref.set(updates, merge=True)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fair_use_state (uid, data, updated_at)
+                   VALUES (%s, %s::jsonb, now())
+                   ON CONFLICT (uid) DO UPDATE
+                       SET data = fair_use_state.data || EXCLUDED.data,
+                           updated_at = now()""",
+                (uid, updates)
+            )
 
 
 def set_fair_use_stage(uid: str, stage: str, **kwargs) -> None:
@@ -80,80 +75,125 @@ def _generate_case_ref() -> str:
 
 def create_fair_use_event(uid: str, event_data: dict) -> str:
     """Create a new fair-use violation event. Returns the event ID."""
-    ref = db.collection('users').document(uid).collection('fair_use_events').document()
+    event_id = str(uuid.uuid4())
     event_data['created_at'] = datetime.utcnow()
     event_data['case_ref'] = _generate_case_ref()
-    ref.set(event_data)
-    return ref.id
+
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fair_use_events (uid, id, data)
+                   VALUES (%s, %s, %s::jsonb)
+                   RETURNING id""",
+                (uid, event_id, event_data)
+            )
+            row = cur.fetchone()
+            return row[0] if row else event_id
 
 
 def get_fair_use_events(uid: str, limit: int = 50) -> list:
     """Get recent fair-use events for a user, newest first."""
-    ref = db.collection('users').document(uid).collection('fair_use_events')
-    docs = ref.order_by('created_at', direction=firestore.Query.DESCENDING).limit(limit).stream()
-    events = []
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        events.append(data)
-    return events
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, resolved, data FROM fair_use_events
+                   WHERE uid = %s
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                (uid, limit)
+            )
+            events = []
+            for row in cur.fetchall():
+                event_id, resolved, data = row
+                data['id'] = event_id
+                data['resolved'] = resolved
+                events.append(data)
+            return events
 
 
 def get_violation_counts(uid: str) -> dict:
     """Count violations in the last 7 and 30 days."""
-    ref = db.collection('users').document(uid).collection('fair_use_events')
-    now = datetime.utcnow()
+    cutoff_30d = datetime.utcnow() - timedelta(days=30)
+    cutoff_7d = datetime.utcnow() - timedelta(days=7)
 
-    count_7d = 0
-    count_30d = 0
-    cutoff_30d = now - timedelta(days=30)
-    cutoff_7d = now - timedelta(days=7)
-
-    docs = ref.where('created_at', '>=', cutoff_30d).stream()
-    for doc in docs:
-        data = doc.to_dict()
-        created = data.get('created_at')
-        if created:
-            # Normalize to naive UTC for comparison (Firestore may return aware datetimes)
-            if isinstance(created, datetime) and created.tzinfo is not None:
-                created = created.replace(tzinfo=None)
-            count_30d += 1
-            if created >= cutoff_7d:
-                count_7d += 1
-
-    return {'violation_count_7d': count_7d, 'violation_count_30d': count_30d}
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT
+                     SUM(CASE WHEN created_at >= %s THEN 1 ELSE 0 END) as count_7d,
+                     SUM(CASE WHEN created_at >= %s THEN 1 ELSE 0 END) as count_30d
+                   FROM fair_use_events
+                   WHERE uid = %s AND NOT resolved""",
+                (cutoff_7d, cutoff_30d, uid)
+            )
+            row = cur.fetchone()
+            if row:
+                count_7d, count_30d = row
+                return {
+                    'violation_count_7d': count_7d or 0,
+                    'violation_count_30d': count_30d or 0
+                }
+            return {'violation_count_7d': 0, 'violation_count_30d': 0}
 
 
 def resolve_fair_use_event(uid: str, event_id: str, admin_uid: str, notes: str = "") -> None:
     """Mark a fair-use event as resolved by admin."""
-    ref = db.collection('users').document(uid).collection('fair_use_events').document(event_id)
-    ref.update(
-        {
-            'resolved': True,
-            'resolved_at': datetime.utcnow(),
-            'resolved_by': admin_uid,
-            'admin_notes': notes,
-        }
-    )
+    resolved_at = datetime.utcnow()
+
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE fair_use_events
+                   SET resolved = TRUE,
+                       data = data || jsonb_build_object(
+                           'resolved_by', %s,
+                           'admin_notes', %s,
+                           'resolved_at', %s::text
+                       )
+                   WHERE uid = %s AND id = %s""",
+                (admin_uid, notes, resolved_at.isoformat(), uid, event_id)
+            )
 
 
 def reset_fair_use_state(uid: str, admin_uid: str) -> None:
     """Reset a user's fair-use state to clean (admin action)."""
-    update_fair_use_state(
-        uid,
-        {
-            'stage': 'none',
-            'violation_count_7d': 0,
-            'violation_count_30d': 0,
-            'last_violation_at': None,
-            'throttle_until': None,
-            'restrict_until': None,
-            'last_classifier_score': 0.0,
-            'last_classifier_type': 'none',
-            'reset_by': admin_uid,
-            'reset_at': datetime.utcnow(),
-        },
-    )
+    reset_at = datetime.utcnow()
+
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            # Reset state to clean
+            cur.execute(
+                """INSERT INTO fair_use_state (uid, data, updated_at)
+                   VALUES (%s, %s::jsonb, now())
+                   ON CONFLICT (uid) DO UPDATE
+                       SET data = %s::jsonb,
+                           updated_at = now()""",
+                (uid, {
+                    'stage': 'none',
+                    'violation_count_7d': 0,
+                    'violation_count_30d': 0,
+                    'last_violation_at': None,
+                    'throttle_until': None,
+                    'restrict_until': None,
+                    'last_classifier_score': 0.0,
+                    'last_classifier_type': 'none',
+                    'reset_by': admin_uid,
+                    'reset_at': reset_at.isoformat(),
+                }, {
+                    'stage': 'none',
+                    'violation_count_7d': 0,
+                    'violation_count_30d': 0,
+                    'last_violation_at': None,
+                    'throttle_until': None,
+                    'restrict_until': None,
+                    'last_classifier_score': 0.0,
+                    'last_classifier_type': 'none',
+                    'reset_by': admin_uid,
+                    'reset_at': reset_at.isoformat(),
+                })
+            )
+            # Clear all events for this user
+            cur.execute("DELETE FROM fair_use_events WHERE uid = %s", (uid,))
 
 
 # ---------------------------------------------------------------------------
@@ -163,25 +203,28 @@ def reset_fair_use_state(uid: str, admin_uid: str) -> None:
 
 def get_flagged_users(stage_filter: Optional[str] = None, limit: int = 100) -> list:
     """Get users with active fair-use enforcement, for admin dashboard."""
-    # Query all users who have fair_use_state with stage != 'none'
-    # This requires a collection group query on fair_use_state
-    query = db.collection_group('fair_use_state')
-    if stage_filter:
-        query = query.where('stage', '==', stage_filter)
-    else:
-        # Use 'in' filter instead of '!=' to allow order_by on 'updated_at'
-        # Firestore requires first order_by to match the inequality field
-        query = query.where('stage', 'in', ['warning', 'throttle', 'restrict'])
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            if stage_filter:
+                cur.execute(
+                    """SELECT uid, data FROM fair_use_state
+                       WHERE data->>'stage' = %s
+                       ORDER BY updated_at DESC
+                       LIMIT %s""",
+                    (stage_filter, limit)
+                )
+            else:
+                cur.execute(
+                    """SELECT uid, data FROM fair_use_state
+                       WHERE data->>'stage' IN ('warning', 'throttle', 'restrict')
+                       ORDER BY updated_at DESC
+                       LIMIT %s""",
+                    (limit,)
+                )
 
-    query = query.order_by('updated_at', direction=firestore.Query.DESCENDING).limit(limit)
-
-    results = []
-    for doc in query.stream():
-        data = doc.to_dict()
-        # Extract uid from document path: users/{uid}/fair_use_state/current
-        path_parts = doc.reference.path.split('/')
-        if len(path_parts) >= 2:
-            data['uid'] = path_parts[1]
-        data['id'] = doc.id
-        results.append(data)
-    return results
+            results = []
+            for uid, data in cur.fetchall():
+                data['uid'] = uid
+                data['id'] = 'current'
+                results.append(data)
+            return results

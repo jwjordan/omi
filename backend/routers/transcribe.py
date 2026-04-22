@@ -26,7 +26,7 @@ from fastapi.websockets import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
 
-from firebase_admin.auth import InvalidIdTokenError
+from utils.other.jwks_auth import InvalidOmiTokenError
 
 from utils.speaker_assignment import (
     process_speaker_assigned_segments,
@@ -2904,7 +2904,7 @@ async def web_listen_handler(
     except ValueError as e:
         await websocket.close(code=1008, reason=str(e))
         return
-    except InvalidIdTokenError:
+    except InvalidOmiTokenError:
         await websocket.send_json({"type": "auth_response", "success": False})
         await websocket.close(code=1008, reason="Invalid token")
         return

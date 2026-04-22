@@ -31,7 +31,9 @@ RUN git clone https://github.com/google/liblc3.git && \
 # Install Python requirements — pusher-specific (no torch/onnxruntime/pyannote)
 WORKDIR /opt/venv
 COPY backend/pusher/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade -r /tmp/requirements.txt
+# --find-links so the locally-built lc3py wheel (from liblc3 git checkout) is
+# used instead of fetching a non-existent arm64 PyPI wheel.
+RUN pip install --no-cache-dir --upgrade --find-links=/tmp/wheels -r /tmp/requirements.txt
 
 FROM python:3.11-slim
 
@@ -58,8 +60,18 @@ COPY backend/models/ ./models/
 COPY backend/routers/ ./routers/
 COPY backend/utils/ ./utils/
 COPY backend/pusher/ ./pusher/
-# CI writes google-credentials.json to backend/ before build (gcp_backend_pusher.yml)
-COPY backend/google-credentials.json ./google-credentials.json
+# pendant-stack: credentials come from a runtime volume mount at
+# /secrets/firebase-service-account.json, surfaced via
+# GOOGLE_APPLICATION_CREDENTIALS env var. No build-time COPY required.
+
+# Runtime CA trust (same pattern as backend/Dockerfile) so pusher can
+# talk to api.deepgram.com / api.omi.me via our local Caddy certs.
+RUN apt-get update && apt-get -y install ca-certificates && rm -rf /var/lib/apt/lists/*
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+COPY backend/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+ENTRYPOINT ["/docker-entrypoint.sh"]
 
 EXPOSE 8080
 CMD ["uvicorn", "pusher.main:app", "--host", "0.0.0.0", "--port", "8080", "--ws-ping-interval", "20", "--ws-ping-timeout", "20", "--loop", "uvloop"]

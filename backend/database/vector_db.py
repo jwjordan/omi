@@ -1,67 +1,219 @@
+"""Vector store backed by local Postgres + pgvector.
+
+Replaces the Pinecone implementation. Two tables (see
+pendant-stack/postgres-init/01-pgvector.sql):
+
+- conversation_vectors  — ns1 equivalent (per-conversation transcript embeddings)
+- memory_vectors        — ns2 equivalent (per-memory distilled-fact embeddings)
+
+Screen-activity (ns3) functions are stubbed to no-op: the pendant use case does
+not generate screenshots and no table exists for them.
+
+Text-embedding-3-large is 3072 dims. pgvector 0.8.x caps vector indexes at 2000
+(ivfflat) / 2000-for-vector or 4000-for-halfvec (HNSW), so we run sequential
+scan with btree prefilter on (uid, created_at). Fine for single-user scale.
+"""
+
 import json
+import logging
 import os
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 
-from pinecone import Pinecone
+from psycopg_pool import ConnectionPool
+from pgvector.psycopg import register_vector
 
 from utils.llm.clients import embeddings
-import logging
 
 logger = logging.getLogger(__name__)
 
-if os.getenv('PINECONE_API_KEY') is not None:
-    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY', ''))
-    index = pc.Index(os.getenv('PINECONE_INDEX_NAME', ''))
-else:
-    index = None
+
+# Preserved for callers that import namespace strings from this module even
+# though namespacing is implicit in the Postgres table split now.
+MEMORIES_NAMESPACE = "ns2"
+SCREEN_ACTIVITY_NAMESPACE = "ns3"
 
 
-def _get_data(uid: str, conversation_id: str, vector: List[float]):
+# ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
+def _build_pool() -> Optional[ConnectionPool]:
+    """Build the module-level pool, or return None if DATABASE_URL is absent.
+
+    We want imports to succeed in environments that don't set DATABASE_URL
+    (tests, CI, early boot). Functions that need the pool raise at call time.
+    """
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return None
+    try:
+        pool = ConnectionPool(
+            database_url,
+            min_size=1,
+            max_size=10,
+            kwargs={"autocommit": True},
+            configure=register_vector,
+        )
+        return pool
+    except Exception as e:
+        logger.warning("vector_db: failed to build Postgres pool: %s", e)
+        return None
+
+
+_pool: Optional[ConnectionPool] = _build_pool()
+
+
+def _reset_pool_for_testing() -> None:
+    """Rebuild the module-level pool. Tests swap DATABASE_URL before calling."""
+    global _pool
+    _pool = _build_pool()
+
+
+def _connection():
+    if _pool is None:
+        raise RuntimeError("DATABASE_URL not configured — vector_db is disabled")
+    return _pool.connection()
+
+
+def _now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+# ---------------------------------------------------------------------------
+# ns1 conversation_vectors
+# ---------------------------------------------------------------------------
+_UPSERT_CONV_SQL = """
+    INSERT INTO conversation_vectors (id, uid, memory_id, created_at, embedding, metadata)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (id) DO UPDATE
+        SET uid = EXCLUDED.uid,
+            memory_id = EXCLUDED.memory_id,
+            created_at = EXCLUDED.created_at,
+            embedding = EXCLUDED.embedding,
+            metadata = EXCLUDED.metadata
+"""
+
+
+def _base_metadata(uid: str, memory_id: str) -> dict:
     return {
-        "id": f'{uid}-{conversation_id}',
-        "values": vector,
-        'metadata': {
-            'uid': uid,
-            'memory_id': conversation_id,
-            'created_at': int(datetime.now(timezone.utc).timestamp()),
-        },
+        "uid": uid,
+        "memory_id": memory_id,
+        "created_at": _now_ts(),
     }
 
 
 def upsert_vector(uid: str, conversation_id: str, vector: List[float]):
-    res = index.upsert(vectors=[_get_data(uid, conversation_id, vector)], namespace="ns1")
-    logger.info(f'upsert_vector {res}')
+    """Upsert a single conversation embedding with default metadata."""
+    meta = _base_metadata(uid, conversation_id)
+    with _connection() as conn:
+        conn.execute(
+            _UPSERT_CONV_SQL,
+            (
+                f"{uid}-{conversation_id}",
+                uid,
+                conversation_id,
+                meta["created_at"],
+                list(vector),
+                json.dumps(meta),
+            ),
+        )
+    logger.info("upsert_vector id=%s-%s", uid, conversation_id)
 
 
 def upsert_vector2(uid: str, conversation_id: str, vector: List[float], metadata: dict):
-    data = _get_data(uid, conversation_id, vector)
-    data['metadata'].update(metadata)
-    res = index.upsert(vectors=[data], namespace="ns1")
-    logger.info(f'upsert_vector {res}')
+    """Upsert a conversation embedding, merging caller metadata into defaults."""
+    meta = _base_metadata(uid, conversation_id)
+    meta.update(metadata or {})
+    with _connection() as conn:
+        conn.execute(
+            _UPSERT_CONV_SQL,
+            (
+                f"{uid}-{conversation_id}",
+                uid,
+                conversation_id,
+                meta["created_at"],
+                list(vector),
+                json.dumps(meta),
+            ),
+        )
+    logger.info("upsert_vector2 id=%s-%s keys=%s", uid, conversation_id, list(metadata or {}))
 
 
 def update_vector_metadata(uid: str, conversation_id: str, metadata: dict):
-    metadata['uid'] = uid
-    metadata['memory_id'] = conversation_id
-    return index.update(f'{uid}-{conversation_id}', set_metadata=metadata, namespace="ns1")
+    """Replace the JSONB metadata for an existing conversation row.
+
+    The Pinecone `update(..., set_metadata=...)` API forced uid + memory_id
+    into the payload. Preserve that behavior so callers that rely on it don't
+    accidentally drop those fields.
+    """
+    metadata = dict(metadata or {})
+    metadata["uid"] = uid
+    metadata["memory_id"] = conversation_id
+    with _connection() as conn:
+        conn.execute(
+            "UPDATE conversation_vectors SET metadata = %s::jsonb WHERE id = %s",
+            (json.dumps(metadata), f"{uid}-{conversation_id}"),
+        )
 
 
 def upsert_vectors(uid: str, vectors: List[List[float]], conversation_ids: List[str]):
-    data = [_get_data(uid, cid, vector) for cid, vector in zip(conversation_ids, vectors)]
-    res = index.upsert(vectors=data, namespace="ns1")
-    logger.info(f'upsert_vectors {res}')
+    """Batch-upsert conversation embeddings atomically: all rows commit or none do."""
+    if not vectors:
+        return
+    now = _now_ts()
+    with _connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for cid, vec in zip(conversation_ids, vectors):
+                    meta = {"uid": uid, "memory_id": cid, "created_at": now}
+                    cur.execute(
+                        _UPSERT_CONV_SQL,
+                        (
+                            f"{uid}-{cid}",
+                            uid,
+                            cid,
+                            now,
+                            list(vec),
+                            json.dumps(meta),
+                        ),
+                    )
+    logger.info("upsert_vectors uid=%s count=%d", uid, len(vectors))
 
 
-def query_vectors(query: str, uid: str, starts_at: int = None, ends_at: int = None, k: int = 5) -> List[str]:
-    filter_data = {'uid': uid}
-    if starts_at is not None:
-        filter_data['created_at'] = {'$gte': starts_at, '$lte': ends_at}
+def query_vectors(
+    query: str,
+    uid: str,
+    starts_at: int = None,
+    ends_at: int = None,
+    k: int = 5,
+) -> List[str]:
+    """Embed `query`, retrieve top-k conversation_ids by cosine distance.
 
+    Returns conversation_ids with the `<uid>-` prefix stripped.
+    """
     xq = embeddings.embed_query(query)
-    xc = index.query(vector=xq, top_k=k, include_metadata=False, filter=filter_data, namespace="ns1")
-    return [item['id'].replace(f'{uid}-', '') for item in xc['matches']]
+
+    sql = [
+        "SELECT id, embedding <=> %s::vector AS distance",
+        "FROM conversation_vectors",
+        "WHERE uid = %s",
+    ]
+    params: list = [list(xq), uid]
+    if starts_at is not None and ends_at is not None:
+        sql.append("AND created_at BETWEEN %s AND %s")
+        params.extend([starts_at, ends_at])
+    sql.append("ORDER BY embedding <=> %s::vector")
+    params.append(list(xq))
+    sql.append("LIMIT %s")
+    params.append(k)
+
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("\n".join(sql), tuple(params))
+            rows = cur.fetchall()
+
+    return [row[0].replace(f"{uid}-", "", 1) for row in rows]
 
 
 def query_vectors_by_metadata(
@@ -74,269 +226,261 @@ def query_vectors_by_metadata(
     dates: List[str],
     limit: int = 5,
 ):
-    filter_data = {
-        '$and': [
-            {'uid': {'$eq': uid}},
-        ]
-    }
-    if people or topics or entities or dates:
-        filter_data['$and'].append(
-            {
-                '$or': [
-                    {'people': {'$in': people}},
-                    {'topics': {'$in': topics}},
-                    {'entities': {'$in': entities}},
-                    # {'dates': {'$in': dates_mentioned}},
-                ]
-            }
-        )
-    if dates_filter and len(dates_filter) == 2 and dates_filter[0] and dates_filter[1]:
-        logger.info(f'dates_filter {dates_filter}')
-        filter_data['$and'].append(
-            {'created_at': {'$gte': int(dates_filter[0].timestamp()), '$lte': int(dates_filter[1].timestamp())}}
-        )
+    """Filter by JSONB arrays (topics/entities/people_mentioned) + optional date range.
 
-    xc = index.query(
-        vector=vector, filter=filter_data, namespace="ns1", include_values=False, include_metadata=True, top_k=1000
+    Post-sorts by how many metadata keys matched (to preserve the Pinecone
+    implementation's behavior). If the metadata-filter query returns nothing,
+    retry once without the metadata clauses.
+    """
+    has_meta_filter = bool(people or topics or entities or dates)
+    has_date_filter = (
+        dates_filter
+        and len(dates_filter) == 2
+        and dates_filter[0]
+        and dates_filter[1]
     )
-    if not xc['matches']:
-        if len(filter_data['$and']) == 3:
-            filter_data['$and'].pop(1)
-            logger.warning(f'query_vectors_by_metadata retrying without structured filters: {json.dumps(filter_data)}')
-            xc = index.query(
-                vector=vector,
-                filter=filter_data,
-                namespace="ns1",
-                include_values=False,
-                include_metadata=True,
-                top_k=20,
+
+    def _run(with_meta: bool) -> list:
+        sql = [
+            "SELECT id, metadata",
+            "FROM conversation_vectors",
+            "WHERE uid = %s",
+        ]
+        params: list = [uid]
+        if with_meta and has_meta_filter:
+            sql.append(
+                "AND ("
+                "metadata->'topics' ?| %s::text[] "
+                "OR metadata->'entities' ?| %s::text[] "
+                "OR metadata->'people_mentioned' ?| %s::text[]"
+                ")"
             )
+            params.extend([topics or [], entities or [], people or []])
+        if has_date_filter:
+            sql.append("AND created_at BETWEEN %s AND %s")
+            params.extend(
+                [int(dates_filter[0].timestamp()), int(dates_filter[1].timestamp())]
+            )
+        sql.append("ORDER BY embedding <=> %s::vector")
+        params.append(list(vector))
+        sql.append("LIMIT %s")
+        params.append(1000)
+        with _connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("\n".join(sql), tuple(params))
+                return cur.fetchall()
+
+    rows = _run(with_meta=True)
+    if not rows:
+        if has_meta_filter and has_date_filter:
+            logger.warning(
+                "query_vectors_by_metadata retrying without structured filters"
+            )
+            rows = _run(with_meta=False)
         else:
             return []
 
-    conversation_id_to_matches = defaultdict(int)
-    for item in xc['matches']:
-        metadata = item['metadata']
-        conversation_id = metadata['memory_id']
-        for topic in topics:
-            if topic in metadata.get('topics', []):
-                conversation_id_to_matches[conversation_id] += 1
-        for entity in entities:
-            if entity in metadata.get('entities', []):
-                conversation_id_to_matches[conversation_id] += 1
-        for person in people:
-            if person in metadata.get('people_mentioned', []):
-                conversation_id_to_matches[conversation_id] += 1
+    conv_match_counts = defaultdict(int)
+    for row in rows:
+        row_id, metadata = row[0], row[1]
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        conv_id = metadata.get("memory_id") or row_id.replace(f"{uid}-", "", 1)
+        for topic in topics or []:
+            if topic in metadata.get("topics", []):
+                conv_match_counts[conv_id] += 1
+        for entity in entities or []:
+            if entity in metadata.get("entities", []):
+                conv_match_counts[conv_id] += 1
+        for person in people or []:
+            if person in metadata.get("people_mentioned", []):
+                conv_match_counts[conv_id] += 1
 
-    conversations_id = [item['id'].replace(f'{uid}-', '') for item in xc['matches']]
-    conversations_id.sort(key=lambda x: conversation_id_to_matches[x], reverse=True)
-    return conversations_id[:limit] if len(conversations_id) > limit else conversations_id
+    conversation_ids = [row[0].replace(f"{uid}-", "", 1) for row in rows]
+    conversation_ids.sort(key=lambda cid: conv_match_counts[cid], reverse=True)
+    return conversation_ids[:limit] if len(conversation_ids) > limit else conversation_ids
 
 
 def delete_vector(uid: str, conversation_id: str):
-    """
-    Delete a conversation vector from Pinecone.
+    """Delete a conversation vector by its composed id."""
+    vector_id = f"{uid}-{conversation_id}"
+    with _connection() as conn:
+        conn.execute(
+            "DELETE FROM conversation_vectors WHERE id = %s",
+            (vector_id,),
+        )
+    logger.info("delete_vector %s", vector_id)
 
-    Note: Vectors are stored with ID format '{uid}-{conversation_id}'
-    """
-    vector_id = f'{uid}-{conversation_id}'
-    result = index.delete(ids=[vector_id], namespace="ns1")
-    logger.info(f'delete_vector {vector_id} {result}')
 
-
-# ==========================================
-# Memory Vector Functions
-# For memory embeddings and semantic search
-# ==========================================
-
-MEMORIES_NAMESPACE = "ns2"
+# ---------------------------------------------------------------------------
+# ns2 memory_vectors
+# ---------------------------------------------------------------------------
+_UPSERT_MEM_SQL = """
+    INSERT INTO memory_vectors (id, uid, memory_id, category, created_at, embedding, metadata)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (id) DO UPDATE
+        SET uid = EXCLUDED.uid,
+            memory_id = EXCLUDED.memory_id,
+            category = EXCLUDED.category,
+            created_at = EXCLUDED.created_at,
+            embedding = EXCLUDED.embedding,
+            metadata = EXCLUDED.metadata
+"""
 
 
 def upsert_memory_vector(uid: str, memory_id: str, content: str, category: str):
-    """
-    Upsert a memory embedding to Pinecone.
-    """
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping memory vector upsert')
+    """Embed `content` and upsert a memory row. Returns the vector used."""
+    if _pool is None:
+        logger.warning("vector_db pool not initialized, skipping memory vector upsert")
         return None
 
     vector = embeddings.embed_query(content)
-    data = {
-        "id": f'{uid}-{memory_id}',
-        "values": vector,
-        "metadata": {
-            "uid": uid,
-            "memory_id": memory_id,
-            "category": category,
-            "created_at": int(datetime.now(timezone.utc).timestamp()),
-        },
+    now = _now_ts()
+    meta = {
+        "uid": uid,
+        "memory_id": memory_id,
+        "category": category,
+        "created_at": now,
     }
-    res = index.upsert(vectors=[data], namespace=MEMORIES_NAMESPACE)
-    logger.info(f'upsert_memory_vector {memory_id} {res}')
+    with _connection() as conn:
+        conn.execute(
+            _UPSERT_MEM_SQL,
+            (
+                f"{uid}-{memory_id}",
+                uid,
+                memory_id,
+                category,
+                now,
+                list(vector),
+                json.dumps(meta),
+            ),
+        )
+    logger.info("upsert_memory_vector %s", memory_id)
     return vector
 
 
 def upsert_memory_vectors_batch(uid: str, items: List[dict]) -> int:
-    """
-    Upsert many memory embeddings to Pinecone in a single request.
-
-    Each item must be a dict with keys: 'memory_id', 'content', 'category'.
-    Batching cuts latency from N embedding calls + N upserts to one embedding
-    call + one upsert. Used by POST /v3/memories/batch and the dev batch API.
-    Returns the number of vectors written (0 if Pinecone is not configured).
-    """
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping memory vector batch upsert')
+    """Batch-embed + batch-upsert memories. Returns count written."""
+    if _pool is None:
+        logger.warning("vector_db pool not initialized, skipping memory batch upsert")
         return 0
-
     if not items:
         return 0
 
-    contents = [item['content'] for item in items]
+    contents = [item["content"] for item in items]
     vectors = embeddings.embed_documents(contents)
+    now = _now_ts()
 
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    payload = [
-        {
-            "id": f"{uid}-{item['memory_id']}",
-            "values": vectors[i],
-            "metadata": {
-                "uid": uid,
-                "memory_id": item['memory_id'],
-                "category": item['category'],
-                "created_at": now_ts,
-            },
-        }
-        for i, item in enumerate(items)
-    ]
-    res = index.upsert(vectors=payload, namespace=MEMORIES_NAMESPACE)
-    logger.info(f'upsert_memory_vectors_batch count={len(payload)} {res}')
-    return len(payload)
+    with _connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for item, vec in zip(items, vectors):
+                    meta = {
+                        "uid": uid,
+                        "memory_id": item["memory_id"],
+                        "category": item["category"],
+                        "created_at": now,
+                    }
+                    cur.execute(
+                        _UPSERT_MEM_SQL,
+                        (
+                            f"{uid}-{item['memory_id']}",
+                            uid,
+                            item["memory_id"],
+                            item["category"],
+                            now,
+                            list(vec),
+                            json.dumps(meta),
+                        ),
+                    )
+
+    logger.info("upsert_memory_vectors_batch count=%d", len(items))
+    return len(items)
 
 
-def find_similar_memories(uid: str, content: str, threshold: float = 0.85, limit: int = 5) -> List[dict]:
-    """
-    Find memories similar to the given content.
-    Returns list of matches with similarity scores.
-    Used for duplicate detection and semantic search.
-    """
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping similarity search')
+def find_similar_memories(
+    uid: str, content: str, threshold: float = 0.85, limit: int = 5
+) -> List[dict]:
+    """Return memories with cosine similarity >= threshold, best first."""
+    if _pool is None:
+        logger.warning("vector_db pool not initialized, skipping memory similarity search")
         return []
 
     vector = embeddings.embed_query(content)
-    filter_data = {'uid': uid}
-
-    xc = index.query(
-        vector=vector, top_k=limit, include_metadata=True, filter=filter_data, namespace=MEMORIES_NAMESPACE
+    sql = (
+        "SELECT memory_id, category, embedding <=> %s::vector AS distance "
+        "FROM memory_vectors "
+        "WHERE uid = %s "
+        "ORDER BY embedding <=> %s::vector "
+        "LIMIT %s"
     )
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (list(vector), uid, list(vector), limit))
+            rows = cur.fetchall()
 
     results = []
-    for match in xc.get('matches', []):
-        if match['score'] >= threshold:
-            results.append(
-                {
-                    'memory_id': match['metadata'].get('memory_id'),
-                    'category': match['metadata'].get('category'),
-                    'score': match['score'],
-                }
-            )
-
+    for row in rows:
+        memory_id, category, distance = row
+        score = 1.0 - float(distance)
+        if score >= threshold:
+            results.append({"memory_id": memory_id, "category": category, "score": score})
     return results
 
 
-def check_memory_duplicate(uid: str, content: str, threshold: float = 0.85) -> dict | None:
-    """
-    Check if a similar memory already exists.
-    Returns the duplicate info if found, None otherwise.
-    """
+def check_memory_duplicate(uid: str, content: str, threshold: float = 0.85):
+    """Top-1 similar memory above threshold, or None."""
     similar = find_similar_memories(uid, content, threshold=threshold, limit=1)
     if similar:
-        logger.warning(f'Found duplicate memory: {similar[0]}')
+        logger.warning("Found duplicate memory: %s", similar[0])
         return similar[0]
     return None
 
 
 def search_memories_by_vector(uid: str, query: str, limit: int = 10) -> List[str]:
-    """
-    Semantic search for memories.
-    Returns list of memory_ids ordered by relevance.
-    """
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping memory search')
+    """Semantic search over memory_vectors. Returns memory_ids, best first."""
+    if _pool is None:
+        logger.warning("vector_db pool not initialized, skipping memory search")
         return []
 
     vector = embeddings.embed_query(query)
-    filter_data = {'uid': uid}
-
-    xc = index.query(
-        vector=vector, top_k=limit, include_metadata=True, filter=filter_data, namespace=MEMORIES_NAMESPACE
+    sql = (
+        "SELECT memory_id "
+        "FROM memory_vectors "
+        "WHERE uid = %s "
+        "ORDER BY embedding <=> %s::vector "
+        "LIMIT %s"
     )
-
-    return [match['metadata'].get('memory_id') for match in xc.get('matches', [])]
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (uid, list(vector), limit))
+            rows = cur.fetchall()
+    return [row[0] for row in rows]
 
 
 def delete_memory_vector(uid: str, memory_id: str):
-    """
-    Delete a memory vector from Pinecone.
-    """
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping memory vector delete')
+    """Delete a memory vector by composed id."""
+    if _pool is None:
+        logger.warning("vector_db pool not initialized, skipping memory vector delete")
         return
+    vector_id = f"{uid}-{memory_id}"
+    with _connection() as conn:
+        conn.execute(
+            "DELETE FROM memory_vectors WHERE id = %s",
+            (vector_id,),
+        )
+    logger.info("delete_memory_vector %s", vector_id)
 
-    vector_id = f'{uid}-{memory_id}'
-    result = index.delete(ids=[vector_id], namespace=MEMORIES_NAMESPACE)
-    logger.info(f'delete_memory_vector {vector_id} {result}')
 
-
-# ==========================================
-# Screen Activity Vector Functions
-# For screenshot embeddings (Gemini embedding-001, 3072-dim)
-# ==========================================
-
-SCREEN_ACTIVITY_NAMESPACE = "ns3"
+# ---------------------------------------------------------------------------
+# ns3 screen_activity: stubbed (no table; pendant use case doesn't generate screenshots)
+# ---------------------------------------------------------------------------
+_SCREEN_STUB_MSG = "screen activity vectors not implemented in pendant-stack build"
 
 
 def upsert_screen_activity_vectors(uid: str, rows: List[dict]) -> int:
-    """Batch upsert screenshot embeddings to Pinecone ns3."""
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping screen activity vector upsert')
-        return 0
-
-    vectors = []
-    for row in rows:
-        embedding = row.get('embedding')
-        if not embedding:
-            continue
-        vectors.append(
-            {
-                "id": f'{uid}-sa-{row["id"]}',
-                "values": embedding,
-                "metadata": {
-                    "uid": uid,
-                    "screenshot_id": str(row['id']),
-                    "timestamp": (
-                        int(datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00')).timestamp())
-                        if isinstance(row['timestamp'], str)
-                        else int(row['timestamp'])
-                    ),
-                    "appName": row.get('appName', ''),
-                },
-            }
-        )
-
-    if not vectors:
-        return 0
-
-    # Pinecone upsert limit is 100 vectors per call
-    upserted = 0
-    for i in range(0, len(vectors), 100):
-        chunk = vectors[i : i + 100]
-        index.upsert(vectors=chunk, namespace=SCREEN_ACTIVITY_NAMESPACE)
-        upserted += len(chunk)
-
-    logger.info(f'upsert_screen_activity_vectors uid={uid} count={upserted}')
-    return upserted
+    logger.warning(_SCREEN_STUB_MSG)
+    return 0
 
 
 def search_screen_activity_vectors(
@@ -347,43 +491,10 @@ def search_screen_activity_vectors(
     app_filter: str = None,
     k: int = 10,
 ) -> List[dict]:
-    """Vector search across screenshot embeddings in ns3."""
-    if index is None:
-        logger.warning('Pinecone index not initialized, skipping screen activity search')
-        return []
-
-    filter_data = {'uid': uid}
-    if start_date and end_date:
-        filter_data['timestamp'] = {'$gte': start_date, '$lte': end_date}
-    elif start_date:
-        filter_data['timestamp'] = {'$gte': start_date}
-    elif end_date:
-        filter_data['timestamp'] = {'$lte': end_date}
-    if app_filter:
-        filter_data['appName'] = app_filter
-
-    xc = index.query(
-        vector=query_vector,
-        top_k=k,
-        include_metadata=True,
-        filter=filter_data,
-        namespace=SCREEN_ACTIVITY_NAMESPACE,
-    )
-
-    return [
-        {
-            'screenshot_id': match['metadata'].get('screenshot_id'),
-            'timestamp': match['metadata'].get('timestamp'),
-            'appName': match['metadata'].get('appName'),
-            'score': match['score'],
-        }
-        for match in xc.get('matches', [])
-    ]
+    logger.warning(_SCREEN_STUB_MSG)
+    return []
 
 
 def delete_screen_activity_vectors(uid: str, ids: List[int]):
-    """Delete screen activity vectors by screenshot IDs."""
-    if index is None:
-        return
-    vector_ids = [f'{uid}-sa-{sid}' for sid in ids]
-    index.delete(ids=vector_ids, namespace=SCREEN_ACTIVITY_NAMESPACE)
+    logger.warning(_SCREEN_STUB_MSG)
+    return

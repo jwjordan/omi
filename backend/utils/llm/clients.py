@@ -7,6 +7,7 @@ import anthropic
 import httpx
 from cachetools import TTLCache
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 import tiktoken
 
@@ -33,15 +34,18 @@ _usage_callback = get_usage_callback()
 # ---------------------------------------------------------------------------
 
 
-class _OpenAIChatProxy:
-    """Forwards every attribute and call to the appropriate ChatOpenAI for the request."""
+class _OpenAIChatProxy(Runnable):
+    """Forwards every attribute and call to the appropriate ChatOpenAI for the request.
 
-    __slots__ = ('_model', '_default', '_ctor_kwargs')
+    Inherits Runnable so `isinstance(proxy, Runnable)` type-checks succeed inside
+    LangChain's pipeline builders (they use isinstance, not __getattr__). Every
+    Runnable method is delegated to the resolved ChatOpenAI.
+    """
 
     def __init__(self, model: str, default: ChatOpenAI, ctor_kwargs: Dict[str, Any]):
-        object.__setattr__(self, '_model', model)
-        object.__setattr__(self, '_default', default)
-        object.__setattr__(self, '_ctor_kwargs', ctor_kwargs)
+        self._model = model
+        self._default = default
+        self._ctor_kwargs = ctor_kwargs
 
     def _resolve(self) -> ChatOpenAI:
         byok = get_byok_key('openai')
@@ -50,6 +54,8 @@ class _OpenAIChatProxy:
         return self._default
 
     def __getattr__(self, name: str):
+        # __getattr__ only fires for missing attributes, so Runnable's own
+        # methods defined below take precedence when present.
         return getattr(self._resolve(), name)
 
     # Needed for `prompt | model | parser`-style chain composition.
@@ -58,6 +64,34 @@ class _OpenAIChatProxy:
 
     def __ror__(self, other):
         return other | self._resolve()
+
+    # Runnable abstract/concrete methods — forward everything to the resolved client.
+    def invoke(self, input, config=None, **kwargs):
+        return self._resolve().invoke(input, config, **kwargs)
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        return await self._resolve().ainvoke(input, config, **kwargs)
+
+    def stream(self, input, config=None, **kwargs):
+        return self._resolve().stream(input, config, **kwargs)
+
+    async def astream(self, input, config=None, **kwargs):
+        async for chunk in self._resolve().astream(input, config, **kwargs):
+            yield chunk
+
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return self._resolve().batch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    async def abatch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return await self._resolve().abatch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    @property
+    def InputType(self):
+        return self._resolve().InputType
+
+    @property
+    def OutputType(self):
+        return self._resolve().OutputType
 
 
 class _AnthropicClientProxy:
@@ -83,19 +117,18 @@ class _AnthropicClientProxy:
 _GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
-class _OpenRouterGeminiProxy:
+class _OpenRouterGeminiProxy(Runnable):
     """For models served via OpenRouter that we want to route direct when BYOK Gemini is set.
 
     Falls back to the OpenRouter-backed default client when no BYOK gemini key
-    is present — so non-BYOK users are unaffected.
+    is present — so non-BYOK users are unaffected. Inherits Runnable so
+    LangChain pipeline isinstance checks succeed.
     """
 
-    __slots__ = ('_default', '_direct_model', '_ctor_kwargs')
-
     def __init__(self, default: ChatOpenAI, direct_model: str, ctor_kwargs: Dict[str, Any]):
-        object.__setattr__(self, '_default', default)
-        object.__setattr__(self, '_direct_model', direct_model)
-        object.__setattr__(self, '_ctor_kwargs', ctor_kwargs)
+        self._default = default
+        self._direct_model = direct_model
+        self._ctor_kwargs = ctor_kwargs
 
     def _resolve(self) -> ChatOpenAI:
         byok = get_byok_key('gemini')
@@ -115,6 +148,33 @@ class _OpenRouterGeminiProxy:
 
     def __ror__(self, other):
         return other | self._resolve()
+
+    def invoke(self, input, config=None, **kwargs):
+        return self._resolve().invoke(input, config, **kwargs)
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        return await self._resolve().ainvoke(input, config, **kwargs)
+
+    def stream(self, input, config=None, **kwargs):
+        return self._resolve().stream(input, config, **kwargs)
+
+    async def astream(self, input, config=None, **kwargs):
+        async for chunk in self._resolve().astream(input, config, **kwargs):
+            yield chunk
+
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return self._resolve().batch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    async def abatch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return await self._resolve().abatch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    @property
+    def InputType(self):
+        return self._resolve().InputType
+
+    @property
+    def OutputType(self):
+        return self._resolve().OutputType
 
 
 class _OpenAIEmbeddingsProxy:
@@ -610,14 +670,15 @@ _persona_medium_default = ChatOpenAI(
 )
 
 
-class _AnthropicViaOpenAIProxy:
-    """Route to Anthropic's OpenAI-compat endpoint when BYOK Anthropic key is set."""
+class _AnthropicViaOpenAIProxy(Runnable):
+    """Route to Anthropic's OpenAI-compat endpoint when BYOK Anthropic key is set.
 
-    __slots__ = ('_default', '_ctor_kwargs')
+    Inherits Runnable so LangChain pipeline isinstance checks succeed.
+    """
 
     def __init__(self, default: ChatOpenAI, ctor_kwargs: Dict[str, Any]):
-        object.__setattr__(self, '_default', default)
-        object.__setattr__(self, '_ctor_kwargs', ctor_kwargs)
+        self._default = default
+        self._ctor_kwargs = ctor_kwargs
 
     def _resolve(self) -> ChatOpenAI:
         byok = get_byok_key('anthropic')
@@ -637,6 +698,33 @@ class _AnthropicViaOpenAIProxy:
 
     def __ror__(self, other):
         return other | self._resolve()
+
+    def invoke(self, input, config=None, **kwargs):
+        return self._resolve().invoke(input, config, **kwargs)
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        return await self._resolve().ainvoke(input, config, **kwargs)
+
+    def stream(self, input, config=None, **kwargs):
+        return self._resolve().stream(input, config, **kwargs)
+
+    async def astream(self, input, config=None, **kwargs):
+        async for chunk in self._resolve().astream(input, config, **kwargs):
+            yield chunk
+
+    def batch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return self._resolve().batch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    async def abatch(self, inputs, config=None, *, return_exceptions=False, **kwargs):
+        return await self._resolve().abatch(inputs, config, return_exceptions=return_exceptions, **kwargs)
+
+    @property
+    def InputType(self):
+        return self._resolve().InputType
+
+    @property
+    def OutputType(self):
+        return self._resolve().OutputType
 
 
 llm_persona_medium_stream = _AnthropicViaOpenAIProxy(

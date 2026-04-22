@@ -2,11 +2,11 @@
 Server-driven config for toggling subscription-surface visibility per
 platform and app version.
 
-Stored in Firestore so the flag can be flipped without a redeploy:
+Stored in Postgres (app_review_config table) so the flag can be flipped without a redeploy:
 
-  Collection: app_review_config
-  Document ID: ios | android | macos
-  Fields:
+  Table: app_review_config
+  id: Platform identifier (ios | android | macos)
+  data: JSONB containing:
     hidden_versions: list[str]   # e.g. ["1.0.531", "1.0.531+607"]
     reviewer_uids:   list[str]   # specific UIDs to always hide for
 
@@ -26,8 +26,19 @@ _CACHE_TTL_SECONDS = 60  # short so flag flips propagate within a minute
 
 
 def _fetch_review_config(platform: str) -> dict:
-    doc = db.collection("app_review_config").document(platform).get()
-    return doc.to_dict() if doc.exists else {}
+    """Fetch review config for a platform from Postgres."""
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT data
+                FROM app_review_config
+                WHERE id = %s
+                """,
+                (platform,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else {}
 
 
 def get_review_config(platform: str) -> dict:
