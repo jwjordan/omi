@@ -20,6 +20,7 @@ from models.conversation import (
     MergeConversationsRequest,
     MergeConversationsResponse,
     SearchRequest,
+    SemanticSearchRequest,
     SetConversationActionItemsStateRequest,
     SetConversationEventsStateRequest,
     TestPromptRequest,
@@ -38,6 +39,10 @@ from models.other import Person
 
 from utils.conversations.process_conversation import process_conversation, retrieve_in_progress_conversation
 from utils.conversations.search import search_conversations
+from utils.conversations.semantic_search import (
+    EmbedServiceUnavailable,
+    semantic_search_conversations,
+)
 from utils.llm.conversation_processing import generate_summary_with_prompt
 from utils.speaker_identification import extract_speaker_samples
 from utils.other import endpoints as auth
@@ -656,6 +661,30 @@ def search_conversations_endpoint(
         start_date=start_timestamp,
         end_date=end_timestamp,
     )
+
+
+@router.post("/v1/conversations/semantic-search", response_model=dict, tags=['conversations'])
+def semantic_search_endpoint(
+    search_request: SemanticSearchRequest,
+    uid: str = Depends(auth.get_current_user_uid),
+):
+    """pgvector-backed semantic search over this user's pendant conversations.
+
+    Stage 3: replaces the legacy Typesense-backed /v1/conversations/search
+    path for our fork. See docs/superpowers/specs/2026-04-22-pendant-stage-3
+    -edwin-mcp-design.md for the contract.
+    """
+    try:
+        return semantic_search_conversations(
+            uid=uid,
+            query=search_request.query,
+            since=search_request.since,
+            until=search_request.until,
+            limit=search_request.limit,
+        )
+    except EmbedServiceUnavailable as e:
+        logger.warning("semantic-search embed service unavailable: %s", e)
+        raise HTTPException(status_code=503, detail="embedding service unavailable")
 
 
 @router.get("/v1/conversations/{conversation_id}/suggested-apps", response_model=dict, tags=['conversations'])

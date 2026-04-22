@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from models.audio_file import AudioFile
 from models.calendar_context import CalendarMeetingContext
@@ -36,6 +36,7 @@ __all__ = [
     'MergeConversationsResponse',
     'PluginResult',
     'SearchRequest',
+    'SemanticSearchRequest',
     'SetConversationActionItemsStateRequest',
     'SetConversationEventsStateRequest',
     'TestPromptRequest',
@@ -241,6 +242,35 @@ class SearchRequest(BaseModel):
     include_discarded: Optional[bool] = True
     start_date: Optional[str] = None  # ISO format datetime string
     end_date: Optional[str] = None  # ISO format datetime string
+
+
+class SemanticSearchRequest(BaseModel):
+    """Request body for POST /v1/conversations/semantic-search.
+
+    Stage 3: pgvector-backed semantic search over conversation_vectors.
+    Distinct from SearchRequest above, which is the legacy Typesense model
+    (kept for upstream compatibility but unused in our fork).
+    """
+
+    query: str = Field(..., min_length=1, description="Natural-language search query")
+    since: Optional[str] = Field(
+        None, description="ISO 8601 lower bound on conversations.started_at"
+    )
+    until: Optional[str] = Field(
+        None, description="ISO 8601 upper bound on conversations.started_at"
+    )
+    limit: int = Field(5, ge=1, le=20, description="Max hits to return")
+
+    @field_validator("since", "until")
+    @classmethod
+    def _validate_iso8601(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValueError(f"invalid ISO 8601 datetime: {v}") from e
+        return v
 
 
 class TestPromptRequest(BaseModel):
