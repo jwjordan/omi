@@ -34,7 +34,9 @@ sys.modules["utils.other.storage"] = MagicMock()
 # Stub utils.llm.clients so modules that import `embeddings` from it can be
 # loaded without the full anthropic/langchain/tiktoken chain.  Tests that need
 # a specific embeddings behaviour patch the name on the module under test.
-sys.modules["utils.llm.clients"] = MagicMock()
+# Use MagicMock() so any attribute access (e.g. get_llm, embeddings) auto-resolves.
+if "utils.llm.clients" not in sys.modules:
+    sys.modules["utils.llm.clients"] = MagicMock()
 
 # ---------------------------------------------------------------------------
 # Stub heavy third-party packages that are not installed in the test venv.
@@ -84,29 +86,15 @@ for _pkg in [
         _stub_pkg(_pkg)
 
 # ---------------------------------------------------------------------------
-# Stub routers that pull in the heavy dependencies above, so that tests that
-# import `main.app` can spin up FastAPI without loading audio/ML code.
-# The conversations router is intentionally left real so its endpoints exist.
-# Each stub exposes a real (empty) APIRouter so that app.include_router()
-# works at import time without installing audio/ML packages.
+# Pre-load routers.conversations so its `from X import Y` bindings are fixed
+# before any individual test module can overwrite X with a bare stub.
+# Other test files (test_task_sharing, test_available_plans_resilience) replace
+# utils.other.storage / database.vector_db with empty ModuleType stubs at
+# module-scope; if routers.conversations were imported after that, the
+# `from utils.other.storage import delete_conversation_audio_files` would fail.
+# Pre-loading here caches the module while the MagicMock stubs above are live.
 # ---------------------------------------------------------------------------
-from fastapi import APIRouter as _APIRouter
-
-_HEAVY_ROUTERS = [
-    "chat", "firmware", "transcribe", "notifications", "speech_profile",
-    "agents", "users", "trends", "sync", "apps", "payment", "integration",
-    "memories", "mcp", "mcp_sse", "oauth", "auth", "action_items",
-    "task_integrations", "integrations", "other", "developer", "updates",
-    "calendar_meetings", "imports", "knowledge_graph", "wrapped", "folders",
-    "goals", "announcements", "phone_calls", "agent_tools", "tools",
-    "metrics", "fair_use_admin", "staged_tasks", "focus_sessions", "advice",
-    "chat_sessions", "scores",
-]
-
-for _rname in _HEAVY_ROUTERS:
-    _key = f"routers.{_rname}"
-    if _key not in sys.modules:
-        _rm = types.ModuleType(_key)
-        _rm.__path__ = []
-        _rm.router = _APIRouter()
-        sys.modules[_key] = _rm
+try:
+    import routers.conversations as _  # noqa: F401
+except Exception:
+    pass  # If it fails here, individual tests will surface the real error.

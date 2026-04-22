@@ -1,25 +1,56 @@
 """Integration tests for POST /v1/conversations/semantic-search.
 
-Uses FastAPI's TestClient with auth dependency overrides, and mocks the
-helper to isolate the route handler from the embedding/SQL path.
+Uses a minimal test-local FastAPI app that includes only the conversations
+router. This isolates endpoint tests from the full main.app router graph
+(40+ routers with heavy ML/audio dependencies).
 """
 
 from unittest.mock import patch
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from main import app
-from utils.other import endpoints as auth_module
+
+def _build_app():
+    import inspect
+    import routers.conversations as _conv_mod
+    from routers.conversations import router as conversations_router
+
+    # Find the exact get_current_user_uid callable bound in the
+    # semantic-search route at decoration time. Other test modules
+    # (test_task_sharing, test_available_plans_resilience) mutate
+    # sys.modules["utils.other.endpoints"].get_current_user_uid after conftest
+    # runs, so we cannot rely on the current value of conv_mod.auth.get_current_user_uid.
+    # The route object itself holds the original function reference.
+    _get_uid_fn = None
+    for route in conversations_router.routes:
+        if hasattr(route, "path") and "semantic-search" in (route.path or ""):
+            sig = inspect.signature(route.endpoint)
+            for param in sig.parameters.values():
+                if hasattr(param.default, "dependency"):
+                    _dep = param.default.dependency
+                    if getattr(_dep, "__name__", "") == "get_current_user_uid":
+                        _get_uid_fn = _dep
+                        break
+            break
+
+    if _get_uid_fn is None:
+        raise RuntimeError("Could not locate get_current_user_uid dep in semantic-search route")
+
+    app = FastAPI()
+    app.include_router(conversations_router)
+
+    async def fake_uid():
+        return "test-uid"
+
+    app.dependency_overrides[_get_uid_fn] = fake_uid
+    return app
 
 
 @pytest.fixture
 def client():
-    # Override get_current_user_uid to a fixed uid for all tests.
-    async def fake_uid():
-        return "test-uid"
-
-    app.dependency_overrides[auth_module.get_current_user_uid] = fake_uid
+    app = _build_app()
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
