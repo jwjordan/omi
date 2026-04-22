@@ -1,12 +1,19 @@
+"""Folders: collections of conversations. Postgres-backed port.
+
+Table structure:
+- folders (uid, id) PK — folder metadata stored in `data` JSONB
+  (name, description, color, icon, order, is_default, is_system, category_mapping, conversation_count, etc.)
+
+Conversations reference folders via data->>'folder_id'. When a folder is deleted,
+conversations can be reparented to another folder or have their folder_id cleared.
+"""
+
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
-from google.cloud import firestore
-from google.cloud.firestore_v1 import FieldFilter
-
 from ._client import db
-from models.folder import Folder
 
 # System folders that are created for new users
 SYSTEM_FOLDERS = [
@@ -75,31 +82,41 @@ CATEGORY_TO_FOLDER_MAPPING = {
 }
 
 
+def _row_to_folder(row) -> Dict[str, Any]:
+    """Merge id + data JSONB into a single folder dict."""
+    folder_id, data = row
+    out = dict(data or {})
+    out['id'] = folder_id
+    return out
+
+
 def get_folders(uid: str) -> List[dict]:
     """Get all folders for a user, sorted by order."""
-    user_ref = db.collection('users').document(uid)
-    folders_ref = user_ref.collection('folders')
-
-    folders = []
-    for doc in folders_ref.order_by('order').stream():
-        folder_data = doc.to_dict()
-        folder_data['id'] = doc.id
-        folders.append(folder_data)
-
-    return folders
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, data FROM folders
+                WHERE uid = %s
+                ORDER BY (data->>'order')::int NULLS LAST, created_at
+                """,
+                (uid,),
+            )
+            return [_row_to_folder(row) for row in cur.fetchall()]
 
 
 def get_folder(uid: str, folder_id: str) -> Optional[dict]:
     """Get a specific folder by ID."""
-    user_ref = db.collection('users').document(uid)
-    folder_doc = user_ref.collection('folders').document(folder_id).get()
-
-    if folder_doc.exists:
-        folder_data = folder_doc.to_dict()
-        folder_data['id'] = folder_doc.id
-        return folder_data
-
-    return None
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, data FROM folders WHERE uid = %s AND id = %s",
+                (uid, folder_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return _row_to_folder(row)
 
 
 def create_folder(
@@ -110,24 +127,25 @@ def create_folder(
     icon: Optional[str] = None,
 ) -> dict:
     """Create a new custom folder for a user."""
-    user_ref = db.collection('users').document(uid)
-    folders_ref = user_ref.collection('folders')
-
     # Get the highest order number
-    existing_folders = list(folders_ref.order_by('order', direction=firestore.Query.DESCENDING).limit(1).stream())
-    max_order = existing_folders[0].to_dict().get('order', 0) if existing_folders else 0
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(MAX((data->>'order')::int), -1) FROM folders WHERE uid = %s",
+                (uid,),
+            )
+            max_order = cur.fetchone()[0]
 
     folder_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
     folder_data = {
-        'id': folder_id,
         'name': name,
         'description': description,
         'color': color or '#6B7280',
         'icon': icon or '📁',
-        'created_at': now,
-        'updated_at': now,
+        'created_at': now.isoformat(),
+        'updated_at': now.isoformat(),
         'order': max_order + 1,
         'is_default': False,
         'is_system': False,
@@ -135,113 +153,142 @@ def create_folder(
         'conversation_count': 0,
     }
 
-    folders_ref.document(folder_id).set(folder_data)
-    return folder_data
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO folders (uid, id, data) VALUES (%s, %s, %s::jsonb)",
+                (uid, folder_id, json.dumps(folder_data)),
+            )
+
+    return {'id': folder_id, **folder_data}
 
 
 def update_folder(uid: str, folder_id: str, update_data: dict) -> bool:
-    """Update a folder's metadata."""
-    user_ref = db.collection('users').document(uid)
-    folder_ref = user_ref.collection('folders').document(folder_id)
-
+    """Update a folder's metadata via JSONB merge."""
     # Add updated_at timestamp
-    update_data['updated_at'] = datetime.now(timezone.utc)
+    update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
 
-    folder_ref.update(update_data)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Build a list of keys to update
+            set_clauses = []
+            params = []
+            for key, value in update_data.items():
+                set_clauses.append(f"data = jsonb_set(data, %s, to_jsonb(%s))")
+                params.extend([f'{{{key}}}', value])
+
+            if not set_clauses:
+                return True
+
+            sql = f"UPDATE folders SET {', '.join(set_clauses)} WHERE uid = %s AND id = %s"
+            params.extend([uid, folder_id])
+
+            # Simpler approach: reconstruct full data and replace
+            folder = get_folder(uid, folder_id)
+            if not folder:
+                return False
+
+            folder.update(update_data)
+            # Remove id from data before storing
+            data_to_store = {k: v for k, v in folder.items() if k != 'id'}
+
+            cur.execute(
+                "UPDATE folders SET data = %s::jsonb WHERE uid = %s AND id = %s",
+                (json.dumps(data_to_store), uid, folder_id),
+            )
+
     return True
 
 
 def delete_folder(uid: str, folder_id: str, move_to_folder_id: Optional[str] = None) -> bool:
     """
-    Delete a folder and move its conversations to another folder.
-    If move_to_folder_id is not provided, moves to the default 'Other' folder.
+    Delete a folder and optionally move its conversations.
+    If move_to_folder_id is provided, reparent conversations to it.
+    If not provided, clear the folder_id field from conversations.
     """
-    user_ref = db.collection('users').document(uid)
-    folder_ref = user_ref.collection('folders').document(folder_id)
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            # Move conversations if target folder specified
+            if move_to_folder_id:
+                cur.execute(
+                    "UPDATE conversations SET data = jsonb_set(data, '{folder_id}', to_jsonb(%s::text)) "
+                    "WHERE uid = %s AND data->>'folder_id' = %s",
+                    (move_to_folder_id, uid, folder_id),
+                )
+            else:
+                # Clear folder_id from conversations
+                cur.execute(
+                    "UPDATE conversations SET data = data - 'folder_id' "
+                    "WHERE uid = %s AND data->>'folder_id' = %s",
+                    (uid, folder_id),
+                )
 
-    # Find target folder
-    target_folder_id = move_to_folder_id
-    if not target_folder_id:
-        # Find the default folder (usually 'Other')
-        folders = get_folders(uid)
-        default_folder = next((f for f in folders if f.get('is_default')), None)
-        if default_folder:
-            target_folder_id = default_folder['id']
+            # Delete the folder
+            cur.execute(
+                "DELETE FROM folders WHERE uid = %s AND id = %s",
+                (uid, folder_id),
+            )
+            deleted = cur.rowcount > 0
 
-    # Move all conversations from this folder to the target folder
-    if target_folder_id:
-        conversations_ref = user_ref.collection('conversations')
-        conversations = conversations_ref.where(filter=FieldFilter('folder_id', '==', folder_id)).stream()
-
-        batch = db.batch()
-        count = 0
-        for conv_doc in conversations:
-            batch.update(conv_doc.reference, {'folder_id': target_folder_id})
-            count += 1
-            if count >= 450:
-                batch.commit()
-                batch = db.batch()
-                count = 0
-
-        if count > 0:
-            batch.commit()
-
-        # Update target folder count
-        update_folder_conversation_count(uid, target_folder_id)
-
-    # Delete the folder
-    folder_ref.delete()
-    return True
+    return deleted
 
 
 def reorder_folders(uid: str, folder_ids: List[str]) -> bool:
     """Reorder folders by providing an ordered list of folder IDs."""
-    user_ref = db.collection('users').document(uid)
-    folders_ref = user_ref.collection('folders')
+    now = datetime.now(timezone.utc).isoformat()
 
-    batch = db.batch()
-    for i, folder_id in enumerate(folder_ids):
-        folder_ref = folders_ref.document(folder_id)
-        batch.update(folder_ref, {'order': i, 'updated_at': datetime.now(timezone.utc)})
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for i, folder_id in enumerate(folder_ids):
+                cur.execute(
+                    "UPDATE folders SET data = jsonb_set(jsonb_set(data, '{order}', to_jsonb(%s::int)), "
+                    "'{updated_at}', to_jsonb(%s)) WHERE uid = %s AND id = %s",
+                    (i, now, uid, folder_id),
+                )
 
-    batch.commit()
     return True
 
 
 def initialize_system_folders(uid: str) -> List[dict]:
     """
     Create system folders for a new user or user without folders.
-    Returns the list of created folders.
+    Returns the list of created folders. Idempotent.
     """
-    user_ref = db.collection('users').document(uid)
-    folders_ref = user_ref.collection('folders')
-
     # Check if already initialized
-    existing = list(folders_ref.limit(1).stream())
-    if existing:
-        return get_folders(uid)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM folders WHERE uid = %s",
+                (uid,),
+            )
+            if cur.fetchone()[0] > 0:
+                return get_folders(uid)
 
     created_folders = []
     now = datetime.now(timezone.utc)
 
-    for i, folder_config in enumerate(SYSTEM_FOLDERS):
-        folder_id = str(uuid.uuid4())
-        folder_data = {
-            'id': folder_id,
-            'name': folder_config['name'],
-            'description': folder_config['description'],
-            'color': folder_config['color'],
-            'icon': folder_config['icon'],
-            'created_at': now,
-            'updated_at': now,
-            'order': i,
-            'is_default': folder_config['category_mapping'] == 'other',
-            'is_system': True,
-            'category_mapping': folder_config['category_mapping'],
-            'conversation_count': 0,
-        }
-        folders_ref.document(folder_id).set(folder_data)
-        created_folders.append(folder_data)
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            for i, folder_config in enumerate(SYSTEM_FOLDERS):
+                folder_id = str(uuid.uuid4())
+                folder_data = {
+                    'name': folder_config['name'],
+                    'description': folder_config['description'],
+                    'color': folder_config['color'],
+                    'icon': folder_config['icon'],
+                    'created_at': now.isoformat(),
+                    'updated_at': now.isoformat(),
+                    'order': i,
+                    'is_default': folder_config['category_mapping'] == 'other',
+                    'is_system': True,
+                    'category_mapping': folder_config['category_mapping'],
+                    'conversation_count': 0,
+                }
+                cur.execute(
+                    "INSERT INTO folders (uid, id, data) VALUES (%s, %s, %s::jsonb)",
+                    (uid, folder_id, json.dumps(folder_data)),
+                )
+                created_folders.append({'id': folder_id, **folder_data})
 
     return created_folders
 
@@ -254,24 +301,36 @@ def get_conversations_in_folder(
     include_discarded: bool = False,
 ) -> List[dict]:
     """Get all conversations in a specific folder."""
-    user_ref = db.collection('users').document(uid)
-    conversations_ref = user_ref.collection('conversations')
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Build query conditionally
+            where_clause = "WHERE uid = %s AND data->>'folder_id' = %s"
+            params = [uid, folder_id]
 
-    query = conversations_ref.where(filter=FieldFilter('folder_id', '==', folder_id))
+            if not include_discarded:
+                where_clause += " AND discarded = FALSE"
 
-    if not include_discarded:
-        query = query.where(filter=FieldFilter('discarded', '==', False))
+            sql = (
+                f"SELECT uid, id, status, discarded, created_at, started_at, finished_at, data "
+                f"FROM conversations {where_clause} "
+                f"ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            )
+            params.extend([limit, offset])
 
-    query = query.order_by('created_at', direction=firestore.Query.DESCENDING)
-    query = query.offset(offset).limit(limit)
-
-    conversations = []
-    for doc in query.stream():
-        conv_data = doc.to_dict()
-        conv_data['id'] = doc.id
-        conversations.append(conv_data)
-
-    return conversations
+            cur.execute(sql, tuple(params))
+            # Return full conversation dicts by merging typed cols into data
+            conversations = []
+            for row in cur.fetchall():
+                _uid, cid, status, discarded, created_at, started_at, finished_at, data = row
+                conv = dict(data or {})
+                conv['id'] = cid
+                conv['status'] = status
+                conv['discarded'] = discarded
+                conv['created_at'] = created_at
+                conv['started_at'] = started_at
+                conv['finished_at'] = finished_at
+                conversations.append(conv)
+            return conversations
 
 
 def move_conversation_to_folder(
@@ -280,18 +339,32 @@ def move_conversation_to_folder(
     folder_id: Optional[str],
 ) -> bool:
     """Move a conversation to a different folder."""
-    user_ref = db.collection('users').document(uid)
-    conv_ref = user_ref.collection('conversations').document(conversation_id)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Get the old folder_id to update counts
+            cur.execute(
+                "SELECT data->>'folder_id' FROM conversations WHERE uid = %s AND id = %s",
+                (uid, conversation_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
 
-    # Get the old folder_id to update counts
-    conv_doc = conv_ref.get()
-    if not conv_doc.exists:
-        return False
+            old_folder_id = row[0]
 
-    old_folder_id = conv_doc.to_dict().get('folder_id')
-
-    # Update the conversation's folder_id
-    conv_ref.update({'folder_id': folder_id})
+            # Update the conversation's folder_id
+            if folder_id:
+                cur.execute(
+                    "UPDATE conversations SET data = jsonb_set(data, '{folder_id}', to_jsonb(%s::text)) "
+                    "WHERE uid = %s AND id = %s",
+                    (folder_id, uid, conversation_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE conversations SET data = data - 'folder_id' "
+                    "WHERE uid = %s AND id = %s",
+                    (uid, conversation_id),
+                )
 
     # Update folder counts
     if old_folder_id:
@@ -311,36 +384,27 @@ def bulk_move_conversations_to_folder(
     if not conversation_ids:
         return 0
 
-    user_ref = db.collection('users').document(uid)
-    conversations_ref = user_ref.collection('conversations')
-
-    conv_refs = [conversations_ref.document(conv_id) for conv_id in conversation_ids]
-    conv_docs = db.get_all(conv_refs)
-
     affected_folders = set()
-    batch = db.batch()
-    count = 0
-    moved = 0
 
-    for conv_doc in conv_docs:
-        if conv_doc is None or not conv_doc.exists:
-            continue
+    with db.batch() as conn:
+        with conn.cursor() as cur:
+            # Get old folder_ids for all conversations
+            cur.execute(
+                "SELECT DISTINCT data->>'folder_id' FROM conversations "
+                "WHERE uid = %s AND id = ANY(%s::text[])",
+                (uid, conversation_ids),
+            )
+            for row in cur.fetchall():
+                if row[0]:
+                    affected_folders.add(row[0])
 
-        old_folder_id = conv_doc.to_dict().get('folder_id')
-        if old_folder_id:
-            affected_folders.add(old_folder_id)
-
-        batch.update(conv_doc.reference, {'folder_id': folder_id})
-        moved += 1
-        count += 1
-
-        if count >= 450:
-            batch.commit()
-            batch = db.batch()
-            count = 0
-
-    if count > 0:
-        batch.commit()
+            # Update all conversations to new folder
+            cur.execute(
+                "UPDATE conversations SET data = jsonb_set(data, '{folder_id}', to_jsonb(%s::text)) "
+                "WHERE uid = %s AND id = ANY(%s::text[])",
+                (folder_id, uid, conversation_ids),
+            )
+            moved = cur.rowcount
 
     affected_folders.add(folder_id)
     for fid in affected_folders:
@@ -351,19 +415,21 @@ def bulk_move_conversations_to_folder(
 
 def update_folder_conversation_count(uid: str, folder_id: str) -> int:
     """Update the conversation count for a folder."""
-    user_ref = db.collection('users').document(uid)
-    conversations_ref = user_ref.collection('conversations')
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # Count conversations in folder that are not discarded
+            cur.execute(
+                "SELECT COUNT(*) FROM conversations WHERE uid = %s AND data->>'folder_id' = %s AND discarded = FALSE",
+                (uid, folder_id),
+            )
+            count = cur.fetchone()[0]
 
-    query = conversations_ref.where(filter=FieldFilter('folder_id', '==', folder_id)).where(
-        filter=FieldFilter('discarded', '==', False)
-    )
-
-    count_query = query.count()
-    result = count_query.get()
-    count = result[0][0].value
-
-    folder_ref = user_ref.collection('folders').document(folder_id)
-    folder_ref.update({'conversation_count': count})
+            # Update folder's conversation_count
+            cur.execute(
+                "UPDATE folders SET data = jsonb_set(data, '{conversation_count}', to_jsonb(%s::int)) "
+                "WHERE uid = %s AND id = %s",
+                (count, uid, folder_id),
+            )
 
     return count
 
