@@ -29,9 +29,10 @@ OPUS_FRAME_DURATION_MS = 20  # 20ms frames (standard for voice)
 OPUS_FRAME_SIZE = OPUS_SAMPLE_RATE * OPUS_FRAME_DURATION_MS // 1000  # 320 samples per frame
 
 # Valid private cloud sync extensions (longest first for correct matching).
-# .batch.opus is the Stage 1c local-disk format (Opus inside a batch blob);
-# upstream only emits .batch.bin / .batch.enc for encrypted batches.
-PRIVATE_CLOUD_EXTENSIONS = ['.batch.opus.enc', '.batch.opus', '.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin']
+# .batch.wav / .wav are the Stage 1c local-disk format (raw PCM in a WAV
+# container — ffmpeg and soundfile decode natively). Upstream emits
+# .batch.bin / .batch.enc / .opus variants.
+PRIVATE_CLOUD_EXTENSIONS = ['.batch.wav', '.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.wav', '.enc', '.bin']
 
 if os.environ.get('SERVICE_ACCOUNT_JSON'):
     service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
@@ -481,14 +482,20 @@ def upload_audio_chunk(
         GCS path of the uploaded chunk
     """
     if LOCAL_AUDIO_ROOT:
+        # Stage 1c: write raw PCM wrapped in a WAV container. Upstream's
+        # custom Opus packet format (encode_pcm_to_opus) isn't a container
+        # ffmpeg can decode — we'd have to re-parse length prefixes and
+        # pipe through opuslib. WAV is ~10x larger but ffmpeg/soundfile
+        # decode it natively, which the worker + enrollment both rely on.
         conv_dir = _local_conv_dir(uid, conversation_id)
         os.makedirs(conv_dir, exist_ok=True)
-        upload_data = encode_pcm_to_opus(chunk_data)
         formatted_timestamp = f'{timestamp:.3f}'
-        path = os.path.join(conv_dir, f'{formatted_timestamp}.opus')
-        with open(path, 'wb') as f:
-            f.write(upload_data)
-        del upload_data
+        path = os.path.join(conv_dir, f'{formatted_timestamp}.wav')
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(OPUS_CHANNELS)
+            wf.setsampwidth(2)  # PCM16
+            wf.setframerate(OPUS_SAMPLE_RATE)
+            wf.writeframes(chunk_data)
         return path
     if STORAGE_DISABLED:
         return ''
@@ -540,18 +547,21 @@ def upload_audio_chunks_batch(
     if not chunks:
         return []
     if LOCAL_AUDIO_ROOT:
+        # Stage 1c: write raw PCM wrapped in a WAV container. See the
+        # upload_audio_chunk local-root branch for rationale.
         conv_dir = _local_conv_dir(uid, conversation_id)
         os.makedirs(conv_dir, exist_ok=True)
         sorted_chunks = sorted(chunks, key=lambda c: c['timestamp'])
         first_ts = f'{sorted_chunks[0]["timestamp"]:.3f}'
         last_ts = f'{sorted_chunks[-1]["timestamp"]:.3f}'
         batch_name = f'{first_ts}-{last_ts}' if len(sorted_chunks) > 1 else first_ts
-        # Local storage does NOT encrypt (single-user trusted host). Write raw
-        # Opus-encoded bytes concatenated.
-        path = os.path.join(conv_dir, f'{batch_name}.batch.opus')
-        with open(path, 'wb') as f:
+        path = os.path.join(conv_dir, f'{batch_name}.batch.wav')
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(OPUS_CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(OPUS_SAMPLE_RATE)
             for chunk in sorted_chunks:
-                f.write(encode_pcm_to_opus(chunk['data']))
+                wf.writeframes(chunk['data'])
         return [path]
     if STORAGE_DISABLED:
         return []

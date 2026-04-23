@@ -62,13 +62,13 @@ def test_upload_audio_chunks_batch_writes_to_local_disk(local_root, monkeypatch)
     assert conv_dir.exists()
     files = list(conv_dir.iterdir())
     assert len(files) == 1
-    assert files[0].name.endswith(".batch.bin") or files[0].name.endswith(".batch.opus")
+    assert files[0].name.endswith(".batch.wav")
 
 
 def test_list_audio_chunks_reads_from_local_disk(local_root):
     (local_root / "uid" / "u1" / "conv" / "c1").mkdir(parents=True)
     (local_root / "uid" / "u1" / "conv" / "c1" / "1000.000.opus").write_bytes(b"x")
-    (local_root / "uid" / "u1" / "conv" / "c1" / "1001.000-1002.000.batch.opus").write_bytes(
+    (local_root / "uid" / "u1" / "conv" / "c1" / "1001.000-1002.000.batch.wav").write_bytes(
         b"yy"
     )
 
