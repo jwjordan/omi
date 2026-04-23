@@ -28,8 +28,10 @@ OPUS_CHANNELS = 1
 OPUS_FRAME_DURATION_MS = 20  # 20ms frames (standard for voice)
 OPUS_FRAME_SIZE = OPUS_SAMPLE_RATE * OPUS_FRAME_DURATION_MS // 1000  # 320 samples per frame
 
-# Valid private cloud sync extensions (longest first for correct matching)
-PRIVATE_CLOUD_EXTENSIONS = ['.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin']
+# Valid private cloud sync extensions (longest first for correct matching).
+# .batch.opus is the Stage 1c local-disk format (Opus inside a batch blob);
+# upstream only emits .batch.bin / .batch.enc for encrypted batches.
+PRIVATE_CLOUD_EXTENSIONS = ['.batch.opus.enc', '.batch.opus', '.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin']
 
 if os.environ.get('SERVICE_ACCOUNT_JSON'):
     service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
@@ -450,9 +452,12 @@ def _strip_extension(filename: str) -> str:
     """Strip private cloud sync extension to get the timestamp string.
 
     Handles both single-chunk filenames (e.g. '1000.000.opus') and
-    batch filenames (e.g. '1000.000-1010.000.batch.bin').
+    batch filenames (e.g. '1000.000-1010.000.batch.bin',
+    '1000.000.batch.opus'). Iterates PRIVATE_CLOUD_EXTENSIONS in
+    longest-first order so compound extensions like `.batch.opus`
+    match before the single `.opus` suffix.
     """
-    for ext in ('.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin'):
+    for ext in PRIVATE_CLOUD_EXTENSIONS:
         if filename.endswith(ext):
             return filename[: -len(ext)]
     return filename.rsplit('.', 1)[0]
