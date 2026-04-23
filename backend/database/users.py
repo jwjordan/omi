@@ -18,7 +18,7 @@ wipes everything the user wrote, not just the profile.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from ._client import db, document_id_from_seed
 from database.redis_db import try_acquire_user_platform_write_lock
@@ -576,6 +576,119 @@ def get_user_speaker_embedding(uid: str) -> Optional[list]:
     if data is None:
         return None
     return data.get('speaker_embedding')
+
+
+def get_people_with_embeddings(uid: str) -> List[Dict[str, Any]]:
+    """Return [{'person_id': str, 'name': str, 'embeddings': List[List[float]]}, ...]
+    for every person under this uid that has at least one stored embedding.
+
+    Stage 1c uses the `embedding` field stored inside each speech_samples
+    entry; upstream samples stored a GCS path, we store the raw vector so
+    we don't need to round-trip through audio storage for matching.
+    """
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT person_id, data
+                FROM user_people
+                WHERE uid = %s
+                """,
+                (uid,),
+            )
+            rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for person_id, data in rows:
+        samples = (data or {}).get('speech_samples', []) or []
+        embeddings = [s.get('embedding') for s in samples if s.get('embedding')]
+        if embeddings:
+            out.append({
+                'person_id': person_id,
+                'name': (data or {}).get('name'),
+                'embeddings': embeddings,
+            })
+    return out
+
+
+def append_person_speech_sample_embedding(
+    uid: str, person_id: str, embedding: List[float], max_samples: int = 10
+) -> bool:
+    """Append a voice-fingerprint embedding to user_people.speech_samples.
+
+    Sample format: {'embedding': [...], 'recorded_at': 'ISO', 'version': 3}.
+    Keeps only the N most recent samples (default 10) to bound per-person
+    storage.
+    """
+    sample = {
+        'embedding': list(embedding),
+        'recorded_at': datetime.now(timezone.utc).isoformat(),
+        'version': 3,
+    }
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM user_people WHERE uid = %s AND person_id = %s FOR UPDATE",
+                (uid, person_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            data = row[0] or {}
+            samples = list(data.get('speech_samples', []) or [])
+            samples.append(sample)
+            if len(samples) > max_samples:
+                samples = samples[-max_samples:]
+            data['speech_samples'] = samples
+            data['speech_samples_version'] = 3
+            cur.execute(
+                """
+                UPDATE user_people
+                SET data = %s::jsonb
+                WHERE uid = %s AND person_id = %s
+                """,
+                (json.dumps(data), uid, person_id),
+            )
+    return True
+
+
+def append_user_speaker_embedding(uid: str, embedding: List[float]) -> bool:
+    """For the user's own voice, upstream Omi stored a single embedding on
+    the user document (set_user_speaker_embedding overwrites). For Stage 1c
+    we also want multi-embedding storage to improve matching over time;
+    keep the legacy single-value field for compatibility but also store a
+    list in data.user_speech_samples.
+    """
+    sample = {
+        'embedding': list(embedding),
+        'recorded_at': datetime.now(timezone.utc).isoformat(),
+        'version': 3,
+    }
+    data = _get_user_data(uid) or {}
+    samples = list(data.get('user_speech_samples', []) or [])
+    samples.append(sample)
+    if len(samples) > 10:
+        samples = samples[-10:]
+    _merge_user_data(uid, {
+        'user_speech_samples': samples,
+        # keep the legacy single-value field in sync with the most recent sample
+        'speaker_embedding': list(embedding),
+        'speaker_embedding_updated_at': sample['recorded_at'],
+    })
+    return True
+
+
+def get_user_speech_samples(uid: str) -> List[List[float]]:
+    """Return all stored voice embeddings for the user's own voice (a list
+    of vectors). Returns the legacy single-value list if multi-sample
+    storage hasn't been populated yet."""
+    data = _get_user_data(uid) or {}
+    samples = data.get('user_speech_samples', []) or []
+    embeddings = [s.get('embedding') for s in samples if s.get('embedding')]
+    if embeddings:
+        return embeddings
+    legacy = data.get('speaker_embedding')
+    return [legacy] if legacy else []
 
 
 def set_person_speaker_embedding(uid: str, person_id: str, embedding: list) -> bool:
