@@ -11,6 +11,7 @@ from typing import Union, Tuple, List, Optional
 from fastapi import HTTPException
 
 from database import redis_db
+from database._client import db
 import database.memories as memories_db
 import database.conversations as conversations_db
 import database.notifications as notification_db
@@ -611,6 +612,26 @@ def save_structured_vector(uid: str, conversation: Conversation, update_only: bo
         update_vector_metadata(uid, conversation.id, metadata)
 
 
+def enqueue_diarization_job(uid: str, conversation_id: str) -> None:
+    """Stage 1c: record this conversation as needing diarization.
+
+    The pusher-side worker thread will pick it up and update transcript
+    segments asynchronously. ON CONFLICT DO NOTHING makes reprocess and
+    retry safe.
+    """
+    sql = """
+        INSERT INTO pending_diarizations (conversation_id, uid, state, enqueued_at)
+        VALUES (%s, %s, 'pending', now())
+        ON CONFLICT (conversation_id) DO NOTHING
+    """
+    try:
+        with db.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (conversation_id, uid))
+    except Exception as e:
+        logger.warning("enqueue_diarization_job failed for %s/%s: %s", uid, conversation_id, e)
+
+
 def _update_personas_async(uid: str):
     logger.info(f"[PERSONAS] Starting persona updates in background thread for uid={uid}")
     personas = get_omi_personas_by_uid_db(uid)
@@ -743,6 +764,11 @@ def process_conversation(
 
     conversation.status = ConversationStatus.completed
     conversations_db.upsert_conversation(uid, conversation.dict())
+
+    # Stage 1c: async diarization. Fire-and-forget enqueue; the pusher-side
+    # worker thread does the actual work and overlays speaker labels later.
+    if not is_reprocess:
+        enqueue_diarization_job(uid, conversation.id)
 
     # Update folder conversation count after conversation is saved
     if assigned_folder_id:
