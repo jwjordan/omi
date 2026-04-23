@@ -463,6 +463,8 @@ def upload_audio_chunk(
     Returns:
         GCS path of the uploaded chunk
     """
+    if STORAGE_DISABLED:
+        return ''
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     protection_level = (
         data_protection_level if data_protection_level is not None else users_db.get_data_protection_level(uid)
@@ -510,6 +512,8 @@ def upload_audio_chunks_batch(
     """
     if not chunks:
         return []
+    if STORAGE_DISABLED:
+        return []
 
     # Sort by timestamp for consistent ordering
     sorted_chunks = sorted(chunks, key=lambda c: c['timestamp'])
@@ -552,6 +556,8 @@ def delete_audio_chunks(uid: str, conversation_id: str, timestamps: List[float])
     Handles both single-chunk blobs (per-timestamp lookup) and batch blobs
     (listed and matched by start timestamp).
     """
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     deleted_batch_paths = set()
 
@@ -601,6 +607,8 @@ def list_audio_chunks(uid: str, conversation_id: str) -> List[dict]:
     Returns:
         List of dicts with chunk info: {'timestamp': float, 'path': str, 'size': int}
     """
+    if STORAGE_DISABLED:
+        return []
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     prefix = f'chunks/{uid}/{conversation_id}/'
     blobs = bucket.list_blobs(prefix=prefix)
@@ -640,6 +648,8 @@ def list_audio_chunks(uid: str, conversation_id: str) -> List[dict]:
 
 def delete_conversation_audio_files(uid: str, conversation_id: str) -> None:
     """Delete all audio files (chunks and merged) for a conversation."""
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(private_cloud_sync_bucket)
 
     # Delete chunks
@@ -677,6 +687,8 @@ def download_audio_chunks_and_merge(
     Returns:
         Merged audio bytes (PCM16)
     """
+    if STORAGE_DISABLED:
+        return b''
 
     bucket = storage_client.bucket(private_cloud_sync_bucket)
 
@@ -882,6 +894,8 @@ def get_or_create_merged_audio(
     Returns:
         Tuple of (audio_data_bytes, was_cached)
     """
+    if STORAGE_DISABLED:
+        return b'', False
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     cache_path = get_cached_merged_audio_path(uid, conversation_id, audio_file_id)
     cache_blob = bucket.blob(cache_path)
@@ -942,6 +956,8 @@ def get_merged_audio_signed_url(uid: str, conversation_id: str, audio_file_id: s
     Returns:
         Signed URL valid for 1 hour, or None if cache doesn't exist
     """
+    if STORAGE_DISABLED:
+        return None
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     cache_path = get_cached_merged_audio_path(uid, conversation_id, audio_file_id)
     cache_blob = bucket.blob(cache_path)
@@ -968,6 +984,8 @@ def get_merged_audio_signed_url(uid: str, conversation_id: str, audio_file_id: s
 
 def delete_cached_merged_audio(uid: str, conversation_id: str) -> None:
     """Delete all cached merged audio for a conversation."""
+    if STORAGE_DISABLED:
+        return
     bucket = storage_client.bucket(private_cloud_sync_bucket)
     prefix = f'merged/{uid}/{conversation_id}/'
     for blob in bucket.list_blobs(prefix=prefix):
