@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -19,6 +20,9 @@ from models.geolocation import Geolocation
 from models.other import Person
 from models.structured import Structured
 from models.transcript_segment import TranscriptSegment
+
+# Stage 1c: Check if local audio root is configured
+_PENDANT_LOCAL_AUDIO_ROOT = os.getenv('PENDANT_LOCAL_AUDIO_ROOT')
 
 # Only locally-defined symbols are exported. Use canonical modules for moved types:
 #   models.conversation_enums, models.structured, models.audio_file, etc.
@@ -83,7 +87,10 @@ class Conversation(BaseModel):
     geolocation: Optional[Geolocation] = None
     photos: List[ConversationPhoto] = []
     audio_files: List[AudioFile] = []
-    private_cloud_sync_enabled: bool = False
+    # Stage 1c: default to True when the stack is configured with local audio
+    # storage, so every conversation gets chunks persisted for post-finalize
+    # diarization. Upstream Omi (no local root env) keeps the old default.
+    private_cloud_sync_enabled: bool = bool(_PENDANT_LOCAL_AUDIO_ROOT)
 
     apps_results: List[AppResult] = []
     suggested_summarization_apps: List[str] = []
