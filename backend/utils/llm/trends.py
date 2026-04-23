@@ -1,5 +1,5 @@
-from typing import List
-from pydantic import BaseModel, Field
+from typing import Any, List
+from pydantic import BaseModel, Field, model_validator
 
 import database.users as users_db
 from database.auth import get_user_name
@@ -28,6 +28,20 @@ class Item(BaseModel):
 
 class ExpectedOutput(BaseModel):
     items: List[Item] = Field(default=[], description="List of items.")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _accept_bare_list_or_none(cls, values: Any) -> Any:
+        """Claude (via llm-proxy) occasionally returns the list directly instead
+        of wrapping it in {"items": [...]}, and sometimes returns None when it
+        decides there's nothing to extract. Accept both shapes; let anything
+        else fall through to the default validator so real malformed output
+        still fails loudly."""
+        if values is None:
+            return {"items": []}
+        if isinstance(values, list):
+            return {"items": values}
+        return values
 
 
 def trends_extractor(uid: str, transcript_segments: List[TranscriptSegment], person_ids: List[str]) -> List[Item]:
