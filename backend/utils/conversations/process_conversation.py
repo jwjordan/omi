@@ -212,7 +212,7 @@ def _get_structured(
             )
         return structured, False
     except Exception as e:
-        logger.error(e)
+        logger.exception(e)  # Stage 1c debug: full traceback for finalize failures
         raise HTTPException(status_code=500, detail="Error processing conversation, please try again later")
 
 
