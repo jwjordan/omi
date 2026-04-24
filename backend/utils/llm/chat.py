@@ -26,6 +26,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _utc_date_str(ts) -> str:
+    """Render a conversation timestamp as a UTC YYYY-MM-DD string.
+
+    Pydantic declares Conversation.created_at as datetime, but the Stage 2
+    Postgres round-trip can leave it as an ISO string depending on the
+    construction path (same rationale as render.py::conversations_to_string).
+    Coerce defensively at the render site.
+    """
+    if isinstance(ts, str):
+        ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    return ts.astimezone(timezone.utc).strftime('%Y-%m-%d')
+
+
 # ****************************************
 # ************* CHAT BASICS **************
 # ****************************************
@@ -1068,7 +1082,7 @@ def retrieve_metadata_fields_from_transcript(
 
     Make sure as a first step, you infer and fix any raw transcript errors and then proceed to extract the information from the entire content.
 
-    For context when extracting dates, today is {created_at.astimezone(timezone.utc).strftime('%Y-%m-%d')} in UTC. {tz} is the user's timezone, convert it to UTC and respond in UTC.
+    For context when extracting dates, today is {_utc_date_str(created_at)} in UTC. {tz} is the user's timezone, convert it to UTC and respond in UTC.
     If one says "today", it means the current day.
     If one says "tomorrow", it means the next day after today.
     If one says "yesterday", it means the day before today.
@@ -1153,7 +1167,7 @@ def retrieve_metadata_from_message(
     3. Organizations, products, locations, or other entities mentioned
     4. Any dates or time references
 
-    For context when extracting dates, today is {created_at.astimezone(timezone.utc).strftime('%Y-%m-%d')} in UTC. 
+    For context when extracting dates, today is {_utc_date_str(created_at)} in UTC.
     {tz} is the user's timezone, convert it to UTC and respond in UTC.
     If the message mentions "today", it means the current day.
     If the message mentions "tomorrow", it means the next day after today.
@@ -1187,7 +1201,7 @@ def retrieve_metadata_from_text(
     3. Organizations, products, locations, or other entities mentioned
     4. Any dates or time references
 
-    For context when extracting dates, today is {created_at.astimezone(timezone.utc).strftime('%Y-%m-%d')} in UTC. 
+    For context when extracting dates, today is {_utc_date_str(created_at)} in UTC.
     {tz} is the user's timezone, convert it to UTC and respond in UTC.
     If the text mentions "today", it means the current day.
     If the text mentions "tomorrow", it means the next day after today.
