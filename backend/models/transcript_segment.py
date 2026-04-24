@@ -35,6 +35,9 @@ class TranscriptSegment(BaseModel):
     translations: Optional[List[Translation]] = []
     speech_profile_processed: bool = True
     stt_provider: Optional[str] = None
+    # Stage 1c: diarizer's cluster label (e.g. "SPEAKER_00"), preserved
+    # across matching so retagging can still look up the cluster's audio.
+    raw_speaker: Optional[str] = None
 
     def __init__(self, **data):
         super().__init__(**data)

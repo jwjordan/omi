@@ -328,10 +328,18 @@ def extract_action_items(
 
     existing_items_context = ""
     if existing_action_items:
+        from datetime import datetime as _dt
         items_list = []
         for item in existing_action_items:
             desc = item.get('description', '')
             due = item.get('due_at')
+            # Stage 1c: due may be a datetime (pre-Postgres) OR an ISO string
+            # after Stage 2 jsonb round-trip. Coerce defensively.
+            if isinstance(due, str):
+                try:
+                    due = _dt.fromisoformat(due.replace('Z', '+00:00'))
+                except ValueError:
+                    due = None
             due_str = due.strftime('%Y-%m-%d %H:%M UTC') if due else 'No due date'
             completed = '✓ Completed' if item.get('completed', False) else 'Pending'
             items_list.append(f"  • {desc} (Due: {due_str}) [{completed}]")

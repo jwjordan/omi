@@ -139,8 +139,17 @@ def conversations_to_string(
     """
     result = []
     people_map = {p.id: p for p in people} if people else {}
+
+    def _fmt(ts) -> str:
+        """Render a datetime-or-ISO-string timestamp. Pydantic model declares these
+        fields as datetime, but Stage 2 Postgres round-trip can leave them as ISO
+        strings depending on the construction path — coerce defensively."""
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return ts.astimezone(timezone.utc).strftime("%d %b %Y at %H:%M") + " UTC"
+
     for i, conversation in enumerate(conversations):
-        formatted_date = conversation.created_at.astimezone(timezone.utc).strftime("%d %b %Y at %H:%M") + " UTC"
+        formatted_date = _fmt(conversation.created_at)
         conversation_str = (
             f"Conversation #{i + 1}\n"
             f"{formatted_date} ({str(conversation.structured.category.value).capitalize()})\n"
@@ -148,12 +157,10 @@ def conversations_to_string(
 
         # Add started_at and finished_at if available
         if conversation.started_at:
-            formatted_started = conversation.started_at.astimezone(timezone.utc).strftime("%d %b %Y at %H:%M") + " UTC"
+            formatted_started = _fmt(conversation.started_at)
             conversation_str += f"Started: {formatted_started}\n"
         if conversation.finished_at:
-            formatted_finished = (
-                conversation.finished_at.astimezone(timezone.utc).strftime("%d %b %Y at %H:%M") + " UTC"
-            )
+            formatted_finished = _fmt(conversation.finished_at)
             conversation_str += f"Finished: {formatted_finished}\n"
 
         conversation_str += f"{str(conversation.structured.title).capitalize()}\n"

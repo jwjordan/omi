@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from routers import pusher, metrics
 from utils.http_client import close_all_clients
+from pusher import diarization_worker, audio_reaper
 
 if os.environ.get('SERVICE_ACCOUNT_JSON'):
     service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
@@ -25,6 +26,12 @@ paths = ['_temp', '_samples', '_segments', '_speech_profiles']
 for path in paths:
     if not os.path.exists(path):
         os.makedirs(path)
+
+
+@app.on_event("startup")
+async def startup_event():
+    diarization_worker.start()
+    audio_reaper.start()
 
 
 @app.on_event("shutdown")

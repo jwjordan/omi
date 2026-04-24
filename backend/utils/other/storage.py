@@ -28,8 +28,11 @@ OPUS_CHANNELS = 1
 OPUS_FRAME_DURATION_MS = 20  # 20ms frames (standard for voice)
 OPUS_FRAME_SIZE = OPUS_SAMPLE_RATE * OPUS_FRAME_DURATION_MS // 1000  # 320 samples per frame
 
-# Valid private cloud sync extensions (longest first for correct matching)
-PRIVATE_CLOUD_EXTENSIONS = ['.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin']
+# Valid private cloud sync extensions (longest first for correct matching).
+# .batch.wav / .wav are the Stage 1c local-disk format (raw PCM in a WAV
+# container — ffmpeg and soundfile decode natively). Upstream emits
+# .batch.bin / .batch.enc / .opus variants.
+PRIVATE_CLOUD_EXTENSIONS = ['.batch.wav', '.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.wav', '.enc', '.bin']
 
 if os.environ.get('SERVICE_ACCOUNT_JSON'):
     service_account_info = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
@@ -56,6 +59,18 @@ desktop_updates_bucket = os.getenv('BUCKET_DESKTOP_UPDATES')
 STORAGE_DISABLED = os.getenv('STORAGE_DISABLED', 'false').lower() in ('true', '1', 'yes')
 if STORAGE_DISABLED:
     logger.warning("STORAGE_DISABLED=true: all cloud-storage functions will short-circuit")
+
+# Stage 1c: local-disk audio storage. When set, chunk upload/list/delete
+# operations target this directory instead of GCS. The layout mirrors
+# GCS: <root>/uid/<uid>/conv/<conversation_id>/<timestamp>.opus
+LOCAL_AUDIO_ROOT = os.getenv('PENDANT_LOCAL_AUDIO_ROOT')
+if LOCAL_AUDIO_ROOT:
+    logger.info("PENDANT_LOCAL_AUDIO_ROOT=%s: chunk storage is local-disk", LOCAL_AUDIO_ROOT)
+
+
+def _local_conv_dir(uid: str, conversation_id: str) -> str:
+    """Return the local directory for a conversation's chunks (not created)."""
+    return os.path.join(LOCAL_AUDIO_ROOT, 'uid', uid, 'conv', conversation_id)
 
 
 # *******************************************
@@ -438,9 +453,12 @@ def _strip_extension(filename: str) -> str:
     """Strip private cloud sync extension to get the timestamp string.
 
     Handles both single-chunk filenames (e.g. '1000.000.opus') and
-    batch filenames (e.g. '1000.000-1010.000.batch.bin').
+    batch filenames (e.g. '1000.000-1010.000.batch.bin',
+    '1000.000.batch.opus'). Iterates PRIVATE_CLOUD_EXTENSIONS in
+    longest-first order so compound extensions like `.batch.opus`
+    match before the single `.opus` suffix.
     """
-    for ext in ('.batch.enc', '.batch.bin', '.opus.enc', '.opus', '.enc', '.bin'):
+    for ext in PRIVATE_CLOUD_EXTENSIONS:
         if filename.endswith(ext):
             return filename[: -len(ext)]
     return filename.rsplit('.', 1)[0]
@@ -463,6 +481,22 @@ def upload_audio_chunk(
     Returns:
         GCS path of the uploaded chunk
     """
+    if LOCAL_AUDIO_ROOT:
+        # Stage 1c: write raw PCM wrapped in a WAV container. Upstream's
+        # custom Opus packet format (encode_pcm_to_opus) isn't a container
+        # ffmpeg can decode — we'd have to re-parse length prefixes and
+        # pipe through opuslib. WAV is ~10x larger but ffmpeg/soundfile
+        # decode it natively, which the worker + enrollment both rely on.
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        os.makedirs(conv_dir, exist_ok=True)
+        formatted_timestamp = f'{timestamp:.3f}'
+        path = os.path.join(conv_dir, f'{formatted_timestamp}.wav')
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(OPUS_CHANNELS)
+            wf.setsampwidth(2)  # PCM16
+            wf.setframerate(OPUS_SAMPLE_RATE)
+            wf.writeframes(chunk_data)
+        return path
     if STORAGE_DISABLED:
         return ''
     bucket = storage_client.bucket(private_cloud_sync_bucket)
@@ -512,6 +546,23 @@ def upload_audio_chunks_batch(
     """
     if not chunks:
         return []
+    if LOCAL_AUDIO_ROOT:
+        # Stage 1c: write raw PCM wrapped in a WAV container. See the
+        # upload_audio_chunk local-root branch for rationale.
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        os.makedirs(conv_dir, exist_ok=True)
+        sorted_chunks = sorted(chunks, key=lambda c: c['timestamp'])
+        first_ts = f'{sorted_chunks[0]["timestamp"]:.3f}'
+        last_ts = f'{sorted_chunks[-1]["timestamp"]:.3f}'
+        batch_name = f'{first_ts}-{last_ts}' if len(sorted_chunks) > 1 else first_ts
+        path = os.path.join(conv_dir, f'{batch_name}.batch.wav')
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(OPUS_CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(OPUS_SAMPLE_RATE)
+            for chunk in sorted_chunks:
+                wf.writeframes(chunk['data'])
+        return [path]
     if STORAGE_DISABLED:
         return []
 
@@ -556,6 +607,20 @@ def delete_audio_chunks(uid: str, conversation_id: str, timestamps: List[float])
     Handles both single-chunk blobs (per-timestamp lookup) and batch blobs
     (listed and matched by start timestamp).
     """
+    if LOCAL_AUDIO_ROOT:
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        if not os.path.isdir(conv_dir):
+            return
+        ts_set = {f'{ts:.3f}' for ts in timestamps}
+        for filename in os.listdir(conv_dir):
+            timestamp_str = _strip_extension(filename)
+            if '-' in timestamp_str:
+                start_ts = timestamp_str.split('-', 1)[0]
+                if start_ts in ts_set:
+                    os.unlink(os.path.join(conv_dir, filename))
+            elif timestamp_str in ts_set:
+                os.unlink(os.path.join(conv_dir, filename))
+        return
     if STORAGE_DISABLED:
         return
     bucket = storage_client.bucket(private_cloud_sync_bucket)
@@ -607,6 +672,32 @@ def list_audio_chunks(uid: str, conversation_id: str) -> List[dict]:
     Returns:
         List of dicts with chunk info: {'timestamp': float, 'path': str, 'size': int}
     """
+    if LOCAL_AUDIO_ROOT:
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        if not os.path.isdir(conv_dir):
+            return []
+        chunks = []
+        for filename in os.listdir(conv_dir):
+            has_valid_ext = any(filename.endswith(ext) for ext in PRIVATE_CLOUD_EXTENSIONS)
+            if not has_valid_ext:
+                continue
+            try:
+                timestamp_str = _strip_extension(filename)
+                is_batch = '.batch.' in filename
+                if is_batch and '-' in timestamp_str:
+                    timestamp = float(timestamp_str.split('-', 1)[0])
+                else:
+                    timestamp = float(timestamp_str)
+                path = os.path.join(conv_dir, filename)
+                chunks.append({
+                    'timestamp': timestamp,
+                    'path': path,
+                    'size': os.path.getsize(path),
+                    'is_batch': is_batch,
+                })
+            except ValueError:
+                continue
+        return sorted(chunks, key=lambda x: x['timestamp'])
     if STORAGE_DISABLED:
         return []
     bucket = storage_client.bucket(private_cloud_sync_bucket)
@@ -648,6 +739,12 @@ def list_audio_chunks(uid: str, conversation_id: str) -> List[dict]:
 
 def delete_conversation_audio_files(uid: str, conversation_id: str) -> None:
     """Delete all audio files (chunks and merged) for a conversation."""
+    if LOCAL_AUDIO_ROOT:
+        import shutil
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        if os.path.isdir(conv_dir):
+            shutil.rmtree(conv_dir)
+        return
     if STORAGE_DISABLED:
         return
     bucket = storage_client.bucket(private_cloud_sync_bucket)
@@ -687,6 +784,35 @@ def download_audio_chunks_and_merge(
     Returns:
         Merged audio bytes (PCM16)
     """
+    if LOCAL_AUDIO_ROOT:
+        conv_dir = _local_conv_dir(uid, conversation_id)
+        if not os.path.isdir(conv_dir):
+            return b''
+        # Collect all chunks whose timestamp (or batch range) covers any
+        # requested timestamp; decode Opus → PCM16; concat in timestamp order.
+        import subprocess
+        pcm_parts = []
+        ts_set = {round(ts, 3) for ts in timestamps}
+        filenames = sorted(os.listdir(conv_dir))
+        for fn in filenames:
+            if not fn.endswith('.opus') and not fn.endswith('.batch.opus'):
+                continue
+            try:
+                ts_str = _strip_extension(fn)
+                ts = round(float(ts_str.split('-', 1)[0] if '-' in ts_str else ts_str), 3)
+            except ValueError:
+                continue
+            if ts not in ts_set and not fn.endswith('.batch.opus'):
+                continue
+            # Decode Opus → PCM16 via ffmpeg (already in the image).
+            src = os.path.join(conv_dir, fn)
+            pcm = subprocess.run(
+                ['ffmpeg', '-loglevel', 'error', '-i', src, '-f', 's16le',
+                 '-ar', str(sample_rate), '-ac', '1', '-'],
+                capture_output=True, check=True,
+            ).stdout
+            pcm_parts.append(pcm)
+        return b''.join(pcm_parts)
     if STORAGE_DISABLED:
         return b''
 

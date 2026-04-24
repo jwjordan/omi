@@ -447,6 +447,23 @@ def set_assignee_conversation_segment(
     #     delete_additional_profile_audio(uid, path)
     #     delete_speech_sample_for_people(uid, path)
 
+    # Stage 1c: learn the voice fingerprint of the tagged segment's cluster.
+    from utils.stt.enrollment import learn_from_cluster
+    target = {
+        'is_user': (assign_type == 'is_user' and bool(value)),
+        'person_id': value if assign_type == 'person_id' else None,
+    }
+    if target['is_user'] or target['person_id']:
+        try:
+            learn_from_cluster(
+                uid,
+                conversation_id,
+                conversation.transcript_segments[segment_idx].raw_speaker,
+                target,
+            )
+        except Exception as e:
+            logger.warning(f"enrollment failed: {e}")
+
     return conversation
 
 
@@ -529,6 +546,25 @@ def set_assignee_conversation_segment(
     #     delete_additional_profile_audio(uid, path)
     #     delete_speech_sample_for_people(uid, path)
 
+    # Stage 1c: learn fingerprint from the tagged cluster.
+    from utils.stt.enrollment import learn_from_cluster
+    target = {
+        'is_user': (assign_type == 'is_user' and bool(value)),
+        'person_id': value if assign_type == 'person_id' else None,
+    }
+    if target['is_user'] or target['person_id']:
+        # Find raw_speaker from any segment with this speaker_id.
+        cluster_label = None
+        for seg in conversation.transcript_segments:
+            if seg.speaker_id == speaker_id and seg.raw_speaker:
+                cluster_label = seg.raw_speaker
+                break
+        if cluster_label:
+            try:
+                learn_from_cluster(uid, conversation_id, cluster_label, target)
+            except Exception as e:
+                logger.warning(f"enrollment failed: {e}")
+
     return conversation
 
 
@@ -577,6 +613,26 @@ def assign_segments_bulk(
             conversation_id=conversation_id,
             segment_ids=data.segment_ids,
         )
+
+    # Stage 1c: learn from the bulk-assigned cluster. Take cluster label
+    # from the first tagged segment (bulk endpoint tags a homogeneous set).
+    from utils.stt.enrollment import learn_from_cluster
+    target = {
+        'is_user': (data.assign_type == 'is_user' and bool(value)),
+        'person_id': value if data.assign_type == 'person_id' else None,
+    }
+    if target['is_user'] or target['person_id']:
+        cluster_label = None
+        for seg_id in data.segment_ids:
+            seg = segment_map.get(seg_id)
+            if seg and seg.raw_speaker:
+                cluster_label = seg.raw_speaker
+                break
+        if cluster_label:
+            try:
+                learn_from_cluster(uid, conversation_id, cluster_label, target)
+            except Exception as e:
+                logger.warning(f"enrollment failed: {e}")
 
     return conversation
 
