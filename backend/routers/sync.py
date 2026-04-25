@@ -47,9 +47,20 @@ from utils.other.storage import (
     get_merged_audio_signed_url,
 )
 
+# Local env read rather than importing STORAGE_DISABLED from utils.other.storage:
+# several sync tests replace the whole storage module with a MagicMock, so
+# `STORAGE_DISABLED` attribute access would resolve to a truthy MagicMock and
+# flip this branch on when it shouldn't be.
+STORAGE_DISABLED = os.getenv('STORAGE_DISABLED', 'false').lower() in ('true', '1', 'yes')
+
 from utils import encryption
 from utils.log_sanitizer import sanitize
-from utils.stt.pre_recorded import deepgram_prerecorded, get_deepgram_model_for_language, postprocess_words
+from utils.stt.pre_recorded import (
+    deepgram_prerecorded,
+    deepgram_prerecorded_from_bytes,
+    get_deepgram_model_for_language,
+    postprocess_words,
+)
 from utils.stt.vad import vad_is_empty
 from utils.fair_use import (
     record_speech_ms,
@@ -921,13 +932,8 @@ def process_segment(
     target_conversation_id: str = None,
 ):
     try:
-        url = get_syncing_file_temporal_signed_url(path)
-
-        def delete_file():
-            time.sleep(480)
-            delete_syncing_temporal_file(path)
-
-        storage_executor.submit(delete_file)
+        url: Optional[str] = None
+        audio_bytes_cache: Optional[bytes] = None
 
         # Apply user transcription preferences (vocabulary, language, model)
         prefs = transcription_prefs or {}
@@ -944,15 +950,49 @@ def process_segment(
         # When single-language mode is active, trust the user's language choice
         # rather than Deepgram's detection (avoids overriding explicit selection).
         use_return_language = not (single_language_mode and user_language)
-        words, detected_language = deepgram_prerecorded(
-            url,
-            speakers_count=3,
-            attempts=0,
-            return_language=True,
-            language=dg_language,
-            model=dg_model,
-            keywords=vocabulary if vocabulary else None,
-        )
+
+        if STORAGE_DISABLED:
+            # Self-hosted pendant-stack path: skip the GCS temporal upload (the
+            # bucket doesn't exist) and feed audio bytes directly to the STT
+            # endpoint. whisper-shim's /v1/listen REST route accepts both
+            # WAV and raw PCM, so transcribe_file works identically.
+            with open(path, 'rb') as f:
+                audio_bytes_cache = f.read()
+
+            def delete_file_local():
+                time.sleep(480)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+            storage_executor.submit(delete_file_local)
+
+            words, detected_language = deepgram_prerecorded_from_bytes(
+                audio_bytes_cache,
+                diarize=True,
+                language=dg_language,
+                model=dg_model,
+                return_language=True,
+            )
+        else:
+            url = get_syncing_file_temporal_signed_url(path)
+
+            def delete_file():
+                time.sleep(480)
+                delete_syncing_temporal_file(path)
+
+            storage_executor.submit(delete_file)
+
+            words, detected_language = deepgram_prerecorded(
+                url,
+                speakers_count=3,
+                attempts=0,
+                return_language=True,
+                language=dg_language,
+                model=dg_model,
+                keywords=vocabulary if vocabulary else None,
+            )
         language = user_language if (single_language_mode and user_language) else detected_language
         if not words:
             # DG processed audio successfully but found no speech (silence/noise).
@@ -965,7 +1005,12 @@ def process_segment(
             return
 
         # Speaker identification: voice embedding matching + text-based detection
-        audio_bytes = _download_audio_bytes(url) if person_embeddings_cache else None
+        if not person_embeddings_cache:
+            audio_bytes = None
+        elif audio_bytes_cache is not None:
+            audio_bytes = audio_bytes_cache
+        else:
+            audio_bytes = _download_audio_bytes(url)
         try:
             identify_speakers_for_segments(transcript_segments, audio_bytes, person_embeddings_cache or {}, uid)
         except Exception as e:
@@ -1112,6 +1157,38 @@ async def sync_local_files(
 
     try:
         paths = retrieve_file_paths(files, uid)
+
+        # File-level dedup guard: drop .bin files whose timestamp falls fully
+        # inside a long live-streamed conversation. The iOS app uploads the
+        # same audio via both the WS stream and this endpoint when "Store
+        # Audio on Cloud" is on, so without this guard the sync path would
+        # re-transcribe and duplicate segments. Skipped when a target
+        # conversation_id is provided (iOS intentionally appending audio to
+        # a known conversation — existing segment-level dedup handles it).
+        if not conversation_id and paths:
+            filtered = []
+            skipped = 0
+            for p in paths:
+                try:
+                    ts = get_timestamp_from_path(p)
+                    if conversations_db.timestamp_inside_long_conversation(uid, ts):
+                        skipped += 1
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                        continue
+                    filtered.append(p)
+                except Exception as e:
+                    logger.warning(f'sync dedup guard: {p} check failed ({e}); processing normally')
+                    filtered.append(p)
+            if skipped:
+                logger.info(f'sync dedup guard: skipped {skipped}/{len(paths)} files already covered uid={uid}')
+            paths = filtered
+
+        if not paths:
+            return {'new_memories': [], 'updated_memories': []}
+
         wav_paths = decode_files_to_wav(paths)
 
         vad_errors = []

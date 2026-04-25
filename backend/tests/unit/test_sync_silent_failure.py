@@ -640,6 +640,7 @@ class TestProcessSegmentReal:
         sys.modules['opuslib'].Decoder = MagicMock()
         sys.modules['pydub'].AudioSegment = MagicMock()
         sys.modules['utils.other.endpoints'].get_current_user_uid = MagicMock()
+        sys.modules['utils.other.storage'].STORAGE_DISABLED = False
         sys.modules['utils.other.storage'].get_syncing_file_temporal_signed_url = MagicMock(return_value='https://fake')
         sys.modules['utils.other.storage'].delete_syncing_temporal_file = MagicMock()
         sys.modules['utils.other.storage'].download_audio_chunks_and_merge = MagicMock()
@@ -648,6 +649,7 @@ class TestProcessSegmentReal:
         sys.modules['utils.log_sanitizer'].sanitize = lambda value: value
         sys.modules['utils.encryption'].encrypt = MagicMock()
         sys.modules['utils.stt.pre_recorded'].deepgram_prerecorded = MagicMock()
+        sys.modules['utils.stt.pre_recorded'].deepgram_prerecorded_from_bytes = MagicMock()
         sys.modules['utils.stt.pre_recorded'].postprocess_words = MagicMock()
         sys.modules['utils.stt.vad'].vad_is_empty = MagicMock()
         sys.modules['utils.fair_use'].FAIR_USE_ENABLED = False
@@ -1034,6 +1036,7 @@ class TestVoiceMessageRuntimeErrorHandling:
         sys.modules['deepgram'].DeepgramClientOptions = MagicMock()
         sys.modules['fal_client'].submit = MagicMock()
         sys.modules['utils.other.endpoints'].timeit = lambda f: f
+        sys.modules['utils.other.storage'].STORAGE_DISABLED = False
         sys.modules['utils.other.storage'].get_syncing_file_temporal_signed_url = MagicMock(return_value='https://fake')
         sys.modules['utils.other.storage'].delete_syncing_temporal_file = MagicMock()
         sys.modules['utils.notifications'].send_notification = MagicMock()
@@ -1062,6 +1065,7 @@ class TestVoiceMessageRuntimeErrorHandling:
 
         # STT stubs
         sys.modules['utils.stt.pre_recorded'].deepgram_prerecorded = MagicMock()
+        sys.modules['utils.stt.pre_recorded'].deepgram_prerecorded_from_bytes = MagicMock()
         sys.modules['utils.stt.pre_recorded'].postprocess_words = MagicMock()
         sys.modules['utils.stt.pre_recorded'].get_deepgram_model_for_language = MagicMock(return_value=('en', 'nova-3'))
 

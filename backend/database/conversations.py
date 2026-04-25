@@ -1259,6 +1259,37 @@ def store_conversation_photos(uid: str, conversation_id: str, photos: List[Conve
 # ********************************
 
 
+def timestamp_inside_long_conversation(
+    uid: str, timestamp: float, min_duration_seconds: int = 120
+) -> bool:
+    """True iff `timestamp` falls inside an existing conversation window
+    that is at least `min_duration_seconds` long.
+
+    Used by the sync-local-files file-level guard: when a .bin file's start
+    timestamp lies inside a long-enough live-streamed conversation, the
+    file almost certainly covers audio already transcribed on the live
+    path, so the sync path skips it to avoid duplicate transcript
+    insertion. Short fragment conversations are ignored by the guard — a
+    typical ~2 min sync chunk would extend well beyond them, so the
+    segment-level dedup in the merge path is the right layer instead.
+    """
+    ts_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM conversations
+                WHERE uid = %s
+                  AND started_at <= %s
+                  AND finished_at >= %s
+                  AND EXTRACT(epoch FROM (finished_at - started_at)) >= %s
+                LIMIT 1
+                """,
+                (uid, ts_dt, ts_dt, min_duration_seconds),
+            )
+            return cur.fetchone() is not None
+
+
 @prepare_for_read(decrypt_func=_prepare_conversation_for_read)
 @with_photos(get_conversation_photos)
 def get_closest_conversation_to_timestamps(uid: str, start_timestamp: int, end_timestamp: int) -> Optional[dict]:

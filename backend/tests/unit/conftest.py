@@ -12,6 +12,15 @@ os.environ.setdefault("DEEPGRAM_API_KEY", "dg-test-fake-for-unit-tests")
 os.environ.setdefault("GOOGLE_API_KEY", "goog-test-fake-for-unit-tests")
 os.environ.setdefault("ANTHROPIC_API_KEY", "ant-test-fake-for-unit-tests")
 
+# Force-clear STORAGE_DISABLED so sync-router tests observe the vanilla
+# (GCS-backed) code paths they were written against. Pendant-stack sets this
+# to "true" at container runtime to activate the local-audio branch in
+# routers/sync.py::process_segment, but the unit tests mock Deepgram URLs
+# and expect `deepgram_prerecorded(url, ...)` rather than the bytes path.
+# Tests exercising the STORAGE_DISABLED branch set it explicitly via
+# monkeypatch.
+os.environ.pop("STORAGE_DISABLED", None)
+
 # Mock psycopg_pool and pgvector before any imports
 sys.modules["psycopg_pool"] = MagicMock()
 sys.modules["pgvector"] = MagicMock()
