@@ -317,6 +317,39 @@ def get_memories_by_ids(uid: str, memory_ids: List[str]) -> List[dict]:
     return memories
 
 
+def mark_memory_promoted_to_edwin(
+    uid: str, memory_id: str, note: Optional[str] = None
+) -> bool:
+    """Flag an Omi memory as promoted into Edwin's curated memory store.
+
+    Edwin's memory pipeline (see container/agent-runner/src/ipc-mcp-stdio.ts
+    `pendant_memory_promote`) writes a markdown file under
+    agents/edwin/memory/ with frontmatter linking back to this memory_id.
+    Stamping the source memory lets us answer "show me memories I haven't
+    promoted yet" queries later, and gives us provenance in both directions.
+    Returns False if the memory does not exist.
+    """
+    now = datetime.now(timezone.utc)
+    payload: Dict[str, Any] = {
+        'promoted_to_edwin': True,
+        'promoted_to_edwin_at': now.isoformat(),
+    }
+    if note:
+        payload['promoted_to_edwin_note'] = note
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE memories
+                SET data = data || %s::jsonb,
+                    updated_at = %s
+                WHERE uid = %s AND id = %s
+                """,
+                (json.dumps(payload), now, uid, memory_id),
+            )
+            return cur.rowcount > 0
+
+
 def review_memory(uid: str, memory_id: str, value: bool):
     now = datetime.now(timezone.utc)
     payload = {'reviewed': True, 'user_review': value}

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ValidationError
 import database.memories as memories_db
 from database.vector_db import (
     delete_memory_vector,
+    search_memories_by_vector,
     upsert_memory_vector,
     upsert_memory_vectors_batch,
 )
@@ -186,3 +187,117 @@ def update_memory_visibility(memory_id: str, value: str, uid: str = Depends(auth
     memories_db.change_memory_visibility(uid, memory_id, value)
     critical_executor.submit(update_personas_async, uid)
     return {'status': 'ok'}
+
+
+# ---------------------------------------------------------------------------
+# Edwin / pendant_memory MCP integration
+# ---------------------------------------------------------------------------
+# Two endpoints exposed to Edwin (NanoClaw) so it can semantically search the
+# pendant-extracted memory pool and promote selected ones into its curated
+# filesystem store. See docs/superpowers/specs (post Stage-3) for the
+# motivating design — Omi captures opportunistically, Edwin curates
+# deliberately, and these endpoints let the curated pool draw from the
+# opportunistic one without merging the two stores.
+
+
+_MEMORIES_SEARCH_MAX = 25
+
+
+class MemoriesSearchRequest(BaseModel):
+    query: str = Field(min_length=1, description="Natural-language search query")
+    limit: int = Field(default=10, ge=1, le=_MEMORIES_SEARCH_MAX)
+
+
+class MemoriesSearchHit(BaseModel):
+    id: str
+    content: str
+    category: Optional[str] = None
+    headline: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    conversation_id: Optional[str] = None
+    created_at: Optional[str] = None
+    rank: int
+    promoted_to_edwin: bool = False
+    promoted_to_edwin_at: Optional[str] = None
+
+
+class MemoriesSearchResponse(BaseModel):
+    query: str
+    hits: List[MemoriesSearchHit]
+
+
+def _hit_from_memory(memory: dict, rank: int) -> MemoriesSearchHit:
+    created_at = memory.get('created_at')
+    if hasattr(created_at, 'isoformat'):
+        created_at = created_at.isoformat()
+    return MemoriesSearchHit(
+        id=memory['id'],
+        content=memory.get('content') or '',
+        category=memory.get('category'),
+        headline=memory.get('headline'),
+        tags=list(memory.get('tags') or []),
+        conversation_id=memory.get('conversation_id'),
+        created_at=created_at,
+        rank=rank,
+        promoted_to_edwin=bool(memory.get('promoted_to_edwin', False)),
+        promoted_to_edwin_at=memory.get('promoted_to_edwin_at'),
+    )
+
+
+@router.post('/v3/memories/search', tags=['memories'], response_model=MemoriesSearchResponse)
+def semantic_search_memories(
+    body: MemoriesSearchRequest,
+    uid: str = Depends(auth.get_current_user_uid),
+):
+    """pgvector-backed semantic search over this user's memories.
+
+    The vector index already exists for save-time dedup; this endpoint reuses
+    it for read-side recall. Results preserve the vector ranking — the
+    decryption layer in get_memories_by_ids may filter or re-order via
+    user_review elsewhere, but this endpoint deliberately leaves rejected
+    memories visible to the caller (Edwin) so it can decide for itself.
+    """
+    ids = search_memories_by_vector(uid, body.query, limit=body.limit)
+    if not ids:
+        return MemoriesSearchResponse(query=body.query, hits=[])
+
+    memories = memories_db.get_memories_by_ids(uid, ids)
+    by_id = {m['id']: m for m in memories}
+
+    hits: List[MemoriesSearchHit] = []
+    for rank, mid in enumerate(ids):
+        m = by_id.get(mid)
+        if m is None:
+            continue
+        hits.append(_hit_from_memory(m, rank=rank))
+    return MemoriesSearchResponse(query=body.query, hits=hits)
+
+
+class PromoteToEdwinRequest(BaseModel):
+    note: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="Optional Edwin-side note (e.g. why it was worth curating)",
+    )
+
+
+@router.post('/v3/memories/{memory_id}/promote-to-edwin', tags=['memories'])
+def promote_memory_to_edwin(
+    memory_id: str,
+    body: PromoteToEdwinRequest,
+    uid: str = Depends(auth.get_current_user_uid),
+):
+    """Flag an Omi memory as promoted into Edwin's curated memory store.
+
+    Idempotent: re-calling refreshes promoted_to_edwin_at and (optionally)
+    overwrites the note. Edwin is responsible for the actual filesystem
+    write on its side — this endpoint only stamps the source memory so we
+    can later answer "what's been promoted" queries without crawling
+    Edwin's filesystem.
+    """
+    if memories_db.get_memory(uid, memory_id) is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    ok = memories_db.mark_memory_promoted_to_edwin(uid, memory_id, note=body.note)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {'status': 'ok', 'memory_id': memory_id}
