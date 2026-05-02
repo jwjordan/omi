@@ -3,7 +3,8 @@ from typing import Optional
 
 import av
 
-from fastapi import APIRouter, UploadFile, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydub import AudioSegment
 
 from database.redis_db import set_speech_profile_duration
@@ -17,6 +18,7 @@ from utils.other.storage import (
     delete_user_person_speech_sample,
     get_user_person_speech_samples,
     get_user_has_speech_profile,
+    verify_signed_local_profile_url,
 )
 from utils.stt.speaker_embedding import extract_embedding
 from utils.stt.vad import apply_vad_for_speech_profile
@@ -35,6 +37,23 @@ def has_speech_profile(uid: str = Depends(auth.get_current_user_uid)):
 @router.get('/v4/speech-profile', tags=['v3'])
 def get_speech_profile(uid: str = Depends(auth.get_current_user_uid)):
     return {'url': get_profile_audio_if_exists(uid, download=False)}
+
+
+@router.get('/v4/speech-profile/audio', tags=['v3'])
+def serve_signed_local_profile_audio(
+    p: str = Query(...),
+    exp: int = Query(...),
+    sig: str = Query(...),
+):
+    """Serve speech-profile or people-profile audio under STORAGE_DISABLED via
+    HMAC-signed URLs minted by storage.py. Anonymous (no bearer) so the
+    iOS just_audio player can fetch it the same way it fetches a GCS signed
+    URL. Signature covers path+expiry; expired or tampered links return 403.
+    """
+    full = verify_signed_local_profile_url(p, exp, sig)
+    if not full:
+        raise HTTPException(status_code=403, detail='invalid or expired signature')
+    return FileResponse(full, media_type='audio/wav')
 
 
 # ******************************************

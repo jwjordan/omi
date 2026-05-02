@@ -1,8 +1,12 @@
+import base64
 import datetime
+import hashlib
+import hmac
 import io
 import json
 import os
 import struct
+import time as _time
 import wave
 from typing import List
 from concurrent.futures import as_completed
@@ -67,6 +71,22 @@ LOCAL_AUDIO_ROOT = os.getenv('PENDANT_LOCAL_AUDIO_ROOT')
 if LOCAL_AUDIO_ROOT:
     logger.info("PENDANT_LOCAL_AUDIO_ROOT=%s: chunk storage is local-disk", LOCAL_AUDIO_ROOT)
 
+# Speech-profile + people-profile audio store. When STORAGE_DISABLED=true,
+# upload/list/delete target this directory and the public-URL path returns
+# HMAC-signed links to a backend route that streams the file. Mirrors GCS
+# layout: <root>/<uid>/speech_profile.wav,
+# <root>/<uid>/additional_profile_recordings/<file>,
+# <root>/<uid>/people_profiles/<person_id>/<file>.
+LOCAL_PROFILE_ROOT = os.getenv('PENDANT_LOCAL_PROFILE_ROOT', '_temp/profiles')
+PUBLIC_API_BASE = os.getenv('PENDANT_PUBLIC_API_BASE', 'https://api.omi.me').rstrip('/')
+PROFILE_URL_TTL_S = int(os.getenv('PENDANT_PROFILE_URL_TTL_S', '300'))
+if STORAGE_DISABLED:
+    logger.info(
+        "STORAGE_DISABLED=true: profile audio stored at %s, public URLs base %s",
+        LOCAL_PROFILE_ROOT,
+        PUBLIC_API_BASE,
+    )
+
 
 def _local_conv_dir(uid: str, conversation_id: str) -> str:
     """Return the local directory for a conversation's chunks (not created)."""
@@ -74,16 +94,112 @@ def _local_conv_dir(uid: str, conversation_id: str) -> str:
 
 
 # *******************************************
+# ******** LOCAL PROFILE STORAGE HELPERS ****
+# *******************************************
+def _profile_signing_key() -> bytes:
+    secret = os.getenv('PENDANT_PROFILE_SIGNING_KEY') or os.getenv('ENCRYPTION_SECRET') or ''
+    if not secret:
+        raise RuntimeError(
+            'PENDANT_PROFILE_SIGNING_KEY or ENCRYPTION_SECRET must be set when STORAGE_DISABLED=true'
+        )
+    return hashlib.sha256(secret.encode('utf-8') + b'|profile_audio').digest()
+
+
+def _local_profile_full_path(rel_path: str) -> str:
+    """Return absolute local-disk path for rel_path (e.g. '{uid}/speech_profile.wav')."""
+    return os.path.normpath(os.path.join(LOCAL_PROFILE_ROOT, rel_path))
+
+
+def _make_signed_local_profile_url(rel_path: str, ttl_seconds: int = None) -> str:
+    """Build an HMAC-signed URL the iOS app can fetch anonymously (just_audio
+    plays GCS-style signed URLs without sending any auth header). Format:
+    {base}/v4/speech-profile/audio?p={b64url(rel_path)}&exp={ts}&sig={hex}.
+    """
+    if ttl_seconds is None:
+        ttl_seconds = PROFILE_URL_TTL_S
+    p = base64.urlsafe_b64encode(rel_path.encode('utf-8')).rstrip(b'=').decode('ascii')
+    exp = int(_time.time()) + ttl_seconds
+    msg = f'{p}|{exp}'.encode('ascii')
+    sig = hmac.new(_profile_signing_key(), msg, hashlib.sha256).hexdigest()
+    return f'{PUBLIC_API_BASE}/v4/speech-profile/audio?p={p}&exp={exp}&sig={sig}'
+
+
+def verify_signed_local_profile_url(p: str, exp: int, sig: str) -> str | None:
+    """Validate a signature and return the absolute file path, or None on failure.
+    Used by the audio-serve route in routers/speech_profile.py.
+    """
+    if not p or not exp or not sig:
+        return None
+    if int(exp) < int(_time.time()):
+        return None
+    expected = hmac.new(_profile_signing_key(), f'{p}|{exp}'.encode('ascii'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    # b64-decode rel_path. Pad back the trailing '=' chars b64decode requires.
+    pad = '=' * (-len(p) % 4)
+    try:
+        rel_path = base64.urlsafe_b64decode(p + pad).decode('utf-8')
+    except (ValueError, UnicodeDecodeError):
+        return None
+    # Reject path-traversal attempts.
+    if '..' in rel_path.split('/'):
+        return None
+    full = _local_profile_full_path(rel_path)
+    return full if os.path.isfile(full) else None
+
+
+def _local_profile_write(rel_path: str, src_path: str) -> str:
+    full = _local_profile_full_path(rel_path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    # Copy in chunks to avoid loading large WAVs into memory all at once.
+    with open(src_path, 'rb') as src, open(full, 'wb') as dst:
+        while True:
+            buf = src.read(64 * 1024)
+            if not buf:
+                break
+            dst.write(buf)
+    return full
+
+
+def _local_profile_write_bytes(rel_path: str, data: bytes) -> str:
+    full = _local_profile_full_path(rel_path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, 'wb') as f:
+        f.write(data)
+    return full
+
+
+def _local_profile_list(rel_dir: str) -> List[str]:
+    """Return list of relative paths (under LOCAL_PROFILE_ROOT) inside rel_dir."""
+    full_dir = _local_profile_full_path(rel_dir)
+    if not os.path.isdir(full_dir):
+        return []
+    return [f'{rel_dir}/{name}' for name in sorted(os.listdir(full_dir))]
+
+
+def _local_profile_delete(rel_path: str) -> bool:
+    full = _local_profile_full_path(rel_path)
+    if os.path.isfile(full):
+        try:
+            os.remove(full)
+            return True
+        except OSError as e:
+            logger.warning('local profile delete failed for %s: %s', rel_path, e)
+    return False
+
+
+# *******************************************
 # ************* SPEECH PROFILE **************
 # *******************************************
 def upload_profile_audio(file_path: str, uid: str):
+    rel = f'{uid}/speech_profile.wav'
     if STORAGE_DISABLED:
-        return ''
+        _local_profile_write(rel, file_path)
+        return _make_signed_local_profile_url(rel)
     bucket = storage_client.bucket(speech_profiles_bucket)
-    path = f'{uid}/speech_profile.wav'
-    blob = bucket.blob(path)
+    blob = bucket.blob(rel)
     blob.upload_from_filename(file_path)
-    return f'https://storage.googleapis.com/{speech_profiles_bucket}/{path}'
+    return f'https://storage.googleapis.com/{speech_profiles_bucket}/{rel}'
 
 
 def get_user_has_speech_profile(uid: str, max_age_days: int = None) -> bool:
@@ -113,11 +229,14 @@ def get_user_has_speech_profile(uid: str, max_age_days: int = None) -> bool:
 
 
 def get_profile_audio_if_exists(uid: str, download: bool = True) -> str:
+    rel = f'{uid}/speech_profile.wav'
     if STORAGE_DISABLED:
-        return None
+        full = _local_profile_full_path(rel)
+        if not os.path.isfile(full):
+            return None
+        return full if download else _make_signed_local_profile_url(rel)
     bucket = storage_client.bucket(speech_profiles_bucket)
-    path = f'{uid}/speech_profile.wav'
-    blob = bucket.blob(path)
+    blob = bucket.blob(rel)
     if blob.exists():
         if download:
             file_path = f'_temp/{uid}_speech_profile.wav'
@@ -129,20 +248,27 @@ def get_profile_audio_if_exists(uid: str, download: bool = True) -> str:
 
 
 def delete_additional_profile_audio(uid: str, file_name: str) -> None:
+    rel = f'{uid}/additional_profile_recordings/{file_name}'
     if STORAGE_DISABLED:
+        if _local_profile_delete(rel):
+            logger.info(f'delete_additional_profile_audio deleting {file_name}')
         return
     bucket = storage_client.bucket(speech_profiles_bucket)
-    blob = bucket.blob(f'{uid}/additional_profile_recordings/{file_name}')
+    blob = bucket.blob(rel)
     if blob.exists():
         logger.info(f'delete_additional_profile_audio deleting {file_name}')
         blob.delete()
 
 
 def get_additional_profile_recordings(uid: str, download: bool = False) -> List[str]:
+    rel_dir = f'{uid}/additional_profile_recordings'
     if STORAGE_DISABLED:
-        return []
+        rels = _local_profile_list(rel_dir)
+        if download:
+            return [_local_profile_full_path(rel) for rel in rels]
+        return [_make_signed_local_profile_url(rel) for rel in rels]
     bucket = storage_client.bucket(speech_profiles_bucket)
-    blobs = bucket.list_blobs(prefix=f'{uid}/additional_profile_recordings/')
+    blobs = bucket.list_blobs(prefix=f'{rel_dir}/')
     if download:
         paths = []
         for blob in blobs:
@@ -160,19 +286,24 @@ def get_additional_profile_recordings(uid: str, download: bool = False) -> List[
 
 
 def delete_user_person_speech_sample(uid: str, person_id: str, file_name: str) -> None:
+    rel = f'{uid}/people_profiles/{person_id}/{file_name}'
     if STORAGE_DISABLED:
+        _local_profile_delete(rel)
         return
     bucket = storage_client.bucket(speech_profiles_bucket)
-    blob = bucket.blob(f'{uid}/people_profiles/{person_id}/{file_name}')
+    blob = bucket.blob(rel)
     if blob.exists():
         blob.delete()
 
 
 def delete_user_person_speech_samples(uid: str, person_id: str) -> None:
+    rel_dir = f'{uid}/people_profiles/{person_id}'
     if STORAGE_DISABLED:
+        for rel in _local_profile_list(rel_dir):
+            _local_profile_delete(rel)
         return
     bucket = storage_client.bucket(speech_profiles_bucket)
-    blobs = bucket.list_blobs(prefix=f'{uid}/people_profiles/{person_id}/')
+    blobs = bucket.list_blobs(prefix=f'{rel_dir}/')
     for blob in blobs:
         blob.delete()
 
@@ -183,9 +314,7 @@ def upload_person_speech_sample_from_bytes(
     person_id: str,
     sample_rate: int = 16000,
 ) -> str:
-    """Upload PCM audio bytes as WAV speech sample. Returns GCS path."""
-    if STORAGE_DISABLED:
-        return ''
+    """Upload PCM audio bytes as WAV speech sample. Returns the storage path."""
     import uuid as uuid_module
 
     wav_buffer = io.BytesIO()
@@ -195,26 +324,38 @@ def upload_person_speech_sample_from_bytes(
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(audio_bytes)
 
-    bucket = storage_client.bucket(speech_profiles_bucket)
     filename = f"{uuid_module.uuid4()}.wav"
-    path = f'{uid}/people_profiles/{person_id}/{filename}'
-    blob = bucket.blob(path)
+    rel = f'{uid}/people_profiles/{person_id}/{filename}'
+    if STORAGE_DISABLED:
+        _local_profile_write_bytes(rel, wav_buffer.getvalue())
+        return rel
+    bucket = storage_client.bucket(speech_profiles_bucket)
+    blob = bucket.blob(rel)
     blob.upload_from_string(wav_buffer.getvalue(), content_type='audio/wav')
 
-    return path
+    return rel
 
 
 def get_user_people_ids(uid: str) -> List[str]:
     if STORAGE_DISABLED:
-        return []
+        full_dir = _local_profile_full_path(f'{uid}/people_profiles')
+        if not os.path.isdir(full_dir):
+            return []
+        return [name for name in sorted(os.listdir(full_dir)) if os.path.isdir(os.path.join(full_dir, name))]
     bucket = storage_client.bucket(speech_profiles_bucket)
     blobs = bucket.list_blobs(prefix=f'{uid}/people_profiles/')
     return [blob.name.split("/")[-2] for blob in blobs]
 
 
 def get_user_person_speech_samples(uid: str, person_id: str, download: bool = False) -> List[str]:
+    rel_dir = f'{uid}/people_profiles/{person_id}'
+    if STORAGE_DISABLED:
+        rels = _local_profile_list(rel_dir)
+        if download:
+            return [_local_profile_full_path(rel) for rel in rels]
+        return [_make_signed_local_profile_url(rel) for rel in rels]
     bucket = storage_client.bucket(speech_profiles_bucket)
-    blobs = bucket.list_blobs(prefix=f'{uid}/people_profiles/{person_id}/')
+    blobs = bucket.list_blobs(prefix=f'{rel_dir}/')
     if download:
         paths = []
         for blob in blobs:
@@ -232,13 +373,15 @@ def get_speech_sample_signed_urls(paths: List[str]) -> List[str]:
     Uses the paths stored in Firestore instead of listing GCS blobs.
 
     Args:
-        paths: List of GCS paths (e.g., '{uid}/people_profiles/{person_id}/{filename}')
+        paths: List of storage paths (e.g., '{uid}/people_profiles/{person_id}/{filename}')
 
     Returns:
         List of signed URLs
     """
     if not paths:
         return []
+    if STORAGE_DISABLED:
+        return [_make_signed_local_profile_url(p) for p in paths]
     bucket = storage_client.bucket(speech_profiles_bucket)
     signed_urls = []
     for path in paths:
