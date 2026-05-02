@@ -88,7 +88,14 @@ def upload_profile_audio(file_path: str, uid: str):
 
 def get_user_has_speech_profile(uid: str, max_age_days: int = None) -> bool:
     if STORAGE_DISABLED:
-        return False
+        # GCS blob check is disabled. Treat presence of a stored speaker
+        # embedding as the source of truth — that's the artifact actually
+        # consumed by the speaker-ID code path in transcribe.py. The original
+        # GCS blob existed only to allow re-extracting the embedding on
+        # demand, which we don't need when the embedding is persisted at
+        # upload time. max_age_days is ignored here (we don't track creation
+        # time for the embedding).
+        return users_db.get_user_speaker_embedding(uid) is not None
     bucket = storage_client.bucket(speech_profiles_bucket)
     blob = bucket.blob(f'{uid}/speech_profile.wav')
     if not blob.exists():
