@@ -27,6 +27,14 @@ from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
 
 from utils.other.jwks_auth import InvalidOmiTokenError
+from utils.wedge_watchdog import (
+    MAX_SELF_HEAL_ATTEMPTS,
+    WEDGE_TIMEOUT_S,
+    record_self_heal_attempt,
+    reset_wedge_count,
+    seconds_since_last_sync_activity,
+    should_attempt_self_heal,
+)
 
 from utils.speaker_assignment import (
     process_speaker_assigned_segments,
@@ -2378,6 +2386,8 @@ async def _stream_handler(
                     if first_audio_byte_timestamp is None:
                         first_audio_byte_timestamp = last_audio_received_time
                         last_usage_record_timestamp = first_audio_byte_timestamp
+                        logger.info(f"first audio byte received bytes={len(data)} {uid} {session_id}")
+                        reset_wedge_count(uid)
 
                     if is_multi_channel:
                         # Multi-channel: demux [channel_id][audio_bytes]
@@ -2613,10 +2623,56 @@ async def _stream_handler(
                 pusher_tasks.append(asyncio.create_task(pusher_receive()))
             pusher_tasks.append(asyncio.create_task(pusher_heartbeat()))
 
+        # Pendant batch-mode wedge watchdog
+        ws_opened_at = time.time()
+
+        async def wedge_self_heal():
+            nonlocal websocket_active, websocket_close_code
+            logger.info(f"Wedge watchdog started timeout={WEDGE_TIMEOUT_S}s {uid} {session_id}")
+            while websocket_active:
+                await asyncio.sleep(30)
+                if not websocket_active:
+                    return
+                ws_age = time.time() - ws_opened_at
+                if ws_age < WEDGE_TIMEOUT_S:
+                    continue
+                # Anchor "no audio" to last_audio_received_time so we catch both
+                # never-received-audio and stopped-mid-session wedges. Initialized
+                # to ws_opened_at on receive_data start, so first window measures
+                # warmup correctly.
+                audio_anchor = last_audio_received_time if last_audio_received_time is not None else ws_opened_at
+                audio_idle = time.time() - audio_anchor
+                sync_idle = seconds_since_last_sync_activity(uid)
+                if audio_idle > WEDGE_TIMEOUT_S and sync_idle > WEDGE_TIMEOUT_S:
+                    if not should_attempt_self_heal(uid):
+                        logger.error(
+                            f"PENDANT WEDGED: self-heal exhausted (>{MAX_SELF_HEAL_ATTEMPTS} attempts) — "
+                            f"power-cycle pendant + relaunch app required. "
+                            f"audio_idle={audio_idle:.0f}s sync_idle={sync_idle:.0f}s "
+                            f"ws_age={ws_age:.0f}s {uid} {session_id}"
+                        )
+                        # Sleep longer between checks once we've given up — no point spamming
+                        await asyncio.sleep(300)
+                        continue
+                    attempt = record_self_heal_attempt(uid)
+                    logger.warning(
+                        f"Wedge detected (self-heal attempt {attempt}/{MAX_SELF_HEAL_ATTEMPTS}): "
+                        f"audio_idle={audio_idle:.0f}s sync_idle={sync_idle:.0f}s "
+                        f"ws_age={ws_age:.0f}s closing WS {uid} {session_id}"
+                    )
+                    websocket_close_code = 1011
+                    websocket_active = False
+                    try:
+                        await websocket.close(code=1011, reason="pendant_wedge_self_heal")
+                    except Exception as e:
+                        logger.error(f"Wedge watchdog close error: {e} {uid} {session_id}")
+                    return
+
         # Tasks
         data_process_task = asyncio.create_task(receive_data(deepgram_socket))
         stream_transcript_task = asyncio.create_task(stream_transcript_process())
         record_usage_task = asyncio.create_task(_record_usage_periodically())
+        wedge_watchdog_task = asyncio.create_task(wedge_self_heal())
 
         _send_message_event(MessageServiceStatusEvent(status="ready"))
 
@@ -2625,6 +2681,7 @@ async def _stream_handler(
             stream_transcript_task,
             heartbeat_task,
             record_usage_task,
+            wedge_watchdog_task,
         ] + pusher_tasks
 
         if is_multi_channel:

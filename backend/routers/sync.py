@@ -16,6 +16,7 @@ import numpy as np
 import httpx
 
 from utils.executors import critical_executor, storage_executor
+from utils.wedge_watchdog import record_sync_activity
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Header, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1497,6 +1498,7 @@ async def sync_local_files_v2(
     Async version of sync-local-files. Does fast-path work (decode, VAD) inline,
     then starts background processing and returns 202 with a job_id for polling.
     """
+    record_sync_activity(uid)
     # Pre-check gates (same as v1)
     if is_hard_restricted(uid):
         raise HTTPException(status_code=429, detail="Account temporarily restricted due to fair-use policy")
@@ -1647,6 +1649,7 @@ async def sync_local_files_v2(
 @router.get("/v2/sync-local-files/{job_id}")
 async def get_sync_job_status(job_id: str, uid: str = Depends(auth.get_current_user_uid)):
     """Poll for the status of an async sync job."""
+    record_sync_activity(uid)
     job = get_sync_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Sync job not found or expired")
