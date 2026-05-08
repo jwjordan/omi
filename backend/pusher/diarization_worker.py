@@ -32,14 +32,25 @@ DIARIZER_URL = os.getenv('HOSTED_DIARIZER_API_URL', 'http://diarizer:8080')
 POLL_INTERVAL_S = float(os.getenv('DIARIZATION_POLL_INTERVAL_S', '5'))
 MAX_ATTEMPTS = int(os.getenv('DIARIZATION_MAX_ATTEMPTS', '3'))
 STALE_RUNNING_MINUTES = int(os.getenv('DIARIZATION_STALE_MINUTES', '10'))
+NO_AUDIO_RETRY_DELAY_S = int(os.getenv('DIARIZATION_NO_AUDIO_RETRY_DELAY_S', '60'))
+NO_AUDIO_GRACE_MINUTES = int(os.getenv('DIARIZATION_NO_AUDIO_GRACE_MINUTES', '15'))
 MIN_CLUSTER_EMBED_SECONDS = 0.5
 SAMPLE_RATE = 16000
 
 
-def _merge_chunks_to_pcm(uid: str, conversation_id: str) -> Optional[bytes]:
+class NoAudioYetError(Exception):
+    """Audio chunks haven't appeared on disk yet — race with the upload pipeline.
+
+    Why: jobs are enqueued at conversation finalization but chunk uploads complete
+    asynchronously up to ~2 min later. Treated as transient so we re-enqueue with
+    delay instead of marking failed.
+    """
+
+
+def _merge_chunks_to_pcm(uid: str, conversation_id: str) -> bytes:
     chunks = list_audio_chunks(uid, conversation_id)
     if not chunks:
-        return None
+        raise NoAudioYetError(f"no audio chunks yet for {uid}/{conversation_id}")
     parts = []
     for c in chunks:
         proc = subprocess.run(
@@ -53,7 +64,7 @@ def _merge_chunks_to_pcm(uid: str, conversation_id: str) -> Optional[bytes]:
             continue
         parts.append(proc.stdout)
     if not parts:
-        return None
+        raise RuntimeError(f"all ffmpeg conversions failed for {uid}/{conversation_id}")
     return b''.join(parts)
 
 
@@ -111,9 +122,6 @@ def _longest_cluster_window(
 
 def _run_job(uid: str, conversation_id: str) -> bool:
     full_pcm = _merge_chunks_to_pcm(uid, conversation_id)
-    if full_pcm is None:
-        logger.warning("diarize: no audio for %s/%s, marking failed", uid, conversation_id)
-        return False
 
     wav = _pcm_to_wav_bytes(full_pcm)
     clusters = _post_diarize(wav)
@@ -171,6 +179,7 @@ def run_one() -> bool:
                 SELECT conversation_id, uid, attempts
                 FROM pending_diarizations
                 WHERE state = 'pending'
+                  AND enqueued_at <= now()
                 ORDER BY enqueued_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -191,6 +200,63 @@ def run_one() -> bool:
 
     try:
         ok = _run_job(uid, conv_id)
+    except NoAudioYetError:
+        # Race with the upload pipeline. Re-enqueue with delay; don't count this
+        # against MAX_ATTEMPTS. Bound total wait by the conversation's
+        # finished_at age so an audio that genuinely never arrives doesn't loop.
+        with db.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT (now() - COALESCE(finished_at, created_at))
+                           > make_interval(mins => %s)
+                    FROM conversations
+                    WHERE uid = %s AND id = %s
+                    """,
+                    (NO_AUDIO_GRACE_MINUTES, uid, conv_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    # Conversation was deleted/merged between enqueue and now.
+                    cur.execute(
+                        """
+                        UPDATE pending_diarizations
+                        SET state = 'failed',
+                            error = 'conversation no longer exists',
+                            finished_at = now()
+                        WHERE conversation_id = %s
+                        """,
+                        (conv_id,),
+                    )
+                elif row[0]:
+                    # Audio finished window has passed without chunks arriving.
+                    cur.execute(
+                        """
+                        UPDATE pending_diarizations
+                        SET state = 'failed',
+                            error = %s,
+                            finished_at = now()
+                        WHERE conversation_id = %s
+                        """,
+                        (
+                            f'no audio after {NO_AUDIO_GRACE_MINUTES}min grace from conversation finish',
+                            conv_id,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE pending_diarizations
+                        SET state = 'pending',
+                            attempts = GREATEST(attempts - 1, 0),
+                            enqueued_at = now() + make_interval(secs => %s),
+                            started_at = NULL,
+                            error = 'audio not yet uploaded; will retry'
+                        WHERE conversation_id = %s
+                        """,
+                        (NO_AUDIO_RETRY_DELAY_S, conv_id),
+                    )
+        return True
     except Exception as e:
         logger.exception("diarization job %s/%s failed: %s", uid, conv_id, e)
         with db.connection() as conn:
@@ -230,7 +296,7 @@ def run_one() -> bool:
                 cur.execute(
                     """
                     UPDATE pending_diarizations
-                    SET state = 'failed', error = 'no audio or conversation missing',
+                    SET state = 'failed', error = 'conversation missing',
                         finished_at = now()
                     WHERE conversation_id = %s
                     """,
