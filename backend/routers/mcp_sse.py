@@ -8,10 +8,12 @@ Implements the MCP 2025-03-26 Streamable HTTP Transport specification.
 """
 
 import asyncio
+import hmac
 import json
 import logging
+import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Union, List, Any
 
 from fastapi import APIRouter, HTTPException, Header, Request, Response
@@ -22,9 +24,12 @@ from utils.other.endpoints import check_rate_limit_inline
 import database.memories as memories_db
 import database.conversations as conversations_db
 import database.mcp_api_key as mcp_api_key_db
+import database.users as users_db
 import database.vector_db as vector_db
 from models.memories import MemoryDB, Memory, MemoryCategory
-from utils.conversations.render import redact_conversation_for_list
+from models.other import Person
+from utils.conversations.factory import deserialize_conversation
+from utils.conversations.render import redact_conversation_for_list, conversations_to_string
 from models.conversation_enums import CategoryEnum
 from utils.llm.memories import identify_category_for_memory
 
@@ -58,6 +63,24 @@ def authenticate_api_key(authorization: Optional[str]) -> Optional[str]:
         return None
 
     return mcp_api_key_db.get_user_id_by_api_key(token)
+
+
+def authenticate_local_trust(local_trust: Optional[str], uid: Optional[str]) -> Optional[str]:
+    """Pendant-stack local-trust auth: shared-secret header lets a trusted host-side
+    process (llm-proxy on host.docker.internal) act as any uid. Bound to the
+    127.0.0.1:18080 docker port mapping; never expose this header on the public
+    api.omi.me endpoint.
+
+    Returns uid if (a) MCP_LOCAL_TRUST_TOKEN is configured, (b) the supplied token
+    matches it via constant-time compare, and (c) a uid header was supplied.
+    Returns None otherwise — caller should fall back to other auth schemes.
+    """
+    expected = os.environ.get("MCP_LOCAL_TRUST_TOKEN", "").strip()
+    if not expected or not local_trust or not uid:
+        return None
+    if not hmac.compare_digest(expected, local_trust.strip()):
+        return None
+    return uid
 
 
 # MCP Tool Definitions
@@ -172,7 +195,71 @@ MCP_TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "deep_search_conversations",
+        "description": (
+            "Semantic vector search across the user's conversations that returns full "
+            "structured summaries AND inline transcript segments with speaker attribution. "
+            "Use this for content-level questions like 'what did Eric ask me to do', 'what "
+            "was decided in the Tuesday meeting', or 'find when I discussed X' — anything "
+            "where you need the actual words spoken, not just titles. One round-trip; "
+            "prefer this over chaining search_conversations + get_conversation_by_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language description of what to find."},
+                "start_date": {
+                    "type": "string",
+                    "description": (
+                        "Filter after this date. Accepts YYYY-MM-DD (interpreted as UTC midnight) "
+                        "or ISO 8601 with timezone (e.g. '2026-04-28T00:00:00-04:00')."
+                    ),
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": (
+                        "Filter before this date. Accepts YYYY-MM-DD (interpreted as UTC end-of-day) "
+                        "or ISO 8601 with timezone."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max conversations returned (default 8, hard cap 20).",
+                    "default": 8,
+                },
+                "max_segments_per_conversation": {
+                    "type": "integer",
+                    "description": (
+                        "Cap transcript segments per conversation to avoid context overflow. "
+                        "Default 40; raise to 100 only when you need exhaustive detail; never above 200."
+                    ),
+                    "default": 40,
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+
+def _parse_flexible_date(value: str, *, end_of_day: bool) -> int:
+    """Parse YYYY-MM-DD or ISO 8601 datetime to a UTC epoch int.
+
+    YYYY-MM-DD with no time component is treated as UTC midnight (or 23:59:59
+    for end_of_day). Anything with a time component is parsed via fromisoformat
+    and converted to UTC.
+    """
+    s = value.strip()
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return int(dt.timestamp())
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 class ToolExecutionError(Exception):
@@ -258,7 +345,11 @@ def execute_tool(user_id: str, tool_name: str, arguments: dict) -> dict:
         limit = arguments.get("limit", 20)
         offset = arguments.get("offset", 0)
 
-        # Parse dates
+        # Parse dates. start_date is interpreted as midnight UTC of that day,
+        # end_date as 23:59:59 UTC of that day so a same-day window (e.g.
+        # start_date == end_date == "2026-05-05") matches everything that
+        # happened on that calendar day in UTC. Without the end-of-day shift,
+        # end_date acted as midnight and same-day queries always returned [].
         start_dt = None
         end_dt = None
         if start_date:
@@ -270,7 +361,9 @@ def execute_tool(user_id: str, tool_name: str, arguments: dict) -> dict:
                 )
         if end_date:
             try:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
             except ValueError:
                 raise ToolExecutionError(f"Invalid end_date format: '{end_date}'. Expected YYYY-MM-DD.", code=-32602)
 
@@ -402,6 +495,71 @@ def execute_tool(user_id: str, tool_name: str, arguments: dict) -> dict:
             )
 
         return {"conversations": results}
+
+    elif tool_name == "deep_search_conversations":
+        query = arguments.get("query")
+        if not query:
+            raise ToolExecutionError("query is required")
+
+        limit = min(int(arguments.get("limit", 8) or 8), 20)
+        max_segments = min(int(arguments.get("max_segments_per_conversation", 40) or 40), 200)
+        start_date = arguments.get("start_date")
+        end_date = arguments.get("end_date")
+
+        starts_at = ends_at = None
+        try:
+            if start_date:
+                starts_at = _parse_flexible_date(start_date, end_of_day=False)
+            if end_date:
+                ends_at = _parse_flexible_date(end_date, end_of_day=True)
+        except ValueError as e:
+            raise ToolExecutionError(
+                f"Invalid date format: {e}. Use YYYY-MM-DD or ISO 8601 with timezone.", code=-32602
+            )
+
+        conversation_ids = vector_db.query_vectors(
+            query, user_id, starts_at=starts_at, ends_at=ends_at, k=limit
+        )
+        if not conversation_ids:
+            return {
+                "summary": f"No conversations matched '{query}' in the requested window.",
+                "conversations": [],
+            }
+
+        raw = conversations_db.get_conversations_by_id(user_id, conversation_ids)
+        raw = [c for c in raw if not c.get("is_locked", False)]
+
+        # Resolve speaker names so the rendered transcript is readable.
+        person_ids = set()
+        for conv in raw:
+            for seg in conv.get("transcript_segments") or []:
+                pid = seg.get("person_id")
+                if pid:
+                    person_ids.add(pid)
+        people: List[Person] = []
+        if person_ids:
+            try:
+                people = [Person(**p) for p in users_db.get_people_by_ids(user_id, list(person_ids))]
+            except Exception as e:
+                logging.warning(f"deep_search_conversations: people fetch failed: {e}")
+
+        rendered: List[Any] = []
+        for conv_data in raw:
+            try:
+                conv = deserialize_conversation(conv_data)
+                if max_segments != -1 and conv.transcript_segments and len(conv.transcript_segments) > max_segments:
+                    conv.transcript_segments = conv.transcript_segments[:max_segments]
+                rendered.append(conv)
+            except Exception as e:
+                logging.warning(f"deep_search_conversations: deserialize failed for {conv_data.get('id')}: {e}")
+
+        body = conversations_to_string(rendered, use_transcript=True, include_timestamps=True, people=people)
+
+        return {
+            "summary": f"Found {len(rendered)} conversations semantically matching '{query}'.",
+            "result": body,
+            "conversation_ids": [c.id for c in rendered],
+        }
 
     else:
         raise ToolExecutionError(f"Unknown tool: {tool_name}", code=-32601)
@@ -540,6 +698,8 @@ async def mcp_streamable_http(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
     accept: Optional[str] = Header(None, alias="Accept"),
+    pendant_local_trust: Optional[str] = Header(None, alias="X-Pendant-Local-Trust"),
+    pendant_uid: Optional[str] = Header(None, alias="X-Pendant-Uid"),
 ):
     """
     Streamable HTTP Transport endpoint for MCP clients.
@@ -550,8 +710,7 @@ async def mcp_streamable_http(
     - Responses are returned as SSE stream or JSON depending on Accept header
     - Session ID is returned in Mcp-Session-Id header after initialization
     """
-    # Authenticate
-    user_id = authenticate_api_key(authorization)
+    user_id = authenticate_local_trust(pendant_local_trust, pendant_uid) or authenticate_api_key(authorization)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid or missing API key. Provide via Authorization header.")
 
