@@ -192,7 +192,9 @@ def run_one() -> bool:
             cur.execute(
                 """
                 UPDATE pending_diarizations
-                SET state = 'running', attempts = attempts + 1, started_at = now()
+                SET state = 'running',
+                    attempts = attempts + 1,
+                    started_at = COALESCE(started_at, now())
                 WHERE conversation_id = %s
                 """,
                 (conv_id,),
@@ -201,23 +203,32 @@ def run_one() -> bool:
     try:
         ok = _run_job(uid, conv_id)
     except NoAudioYetError:
-        # Race with the upload pipeline. Re-enqueue with delay; don't count this
-        # against MAX_ATTEMPTS. Bound total wait by the conversation's
-        # finished_at age so an audio that genuinely never arrives doesn't loop.
+        # Race with the upload pipeline. Re-enqueue with delay; don't count
+        # this against MAX_ATTEMPTS. Bound total wait by `started_at` (preserved
+        # across retries via the COALESCE above) — that's "how long we've been
+        # waiting for chunks". We can't use conversation.finished_at because
+        # offline-then-sync flows backdate it to the device clock; a job
+        # enqueued at sync time would look already-over-grace.
         with db.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
+                    "SELECT 1 FROM conversations WHERE uid = %s AND id = %s",
+                    (uid, conv_id),
+                )
+                conv_exists = cur.fetchone() is not None
+
+                cur.execute(
                     """
-                    SELECT (now() - COALESCE(finished_at, created_at))
-                           > make_interval(mins => %s)
-                    FROM conversations
-                    WHERE uid = %s AND id = %s
+                    SELECT (now() - started_at) > make_interval(mins => %s)
+                    FROM pending_diarizations
+                    WHERE conversation_id = %s
                     """,
-                    (NO_AUDIO_GRACE_MINUTES, uid, conv_id),
+                    (NO_AUDIO_GRACE_MINUTES, conv_id),
                 )
                 row = cur.fetchone()
-                if row is None:
-                    # Conversation was deleted/merged between enqueue and now.
+                over_grace = bool(row and row[0])
+
+                if not conv_exists:
                     cur.execute(
                         """
                         UPDATE pending_diarizations
@@ -228,8 +239,7 @@ def run_one() -> bool:
                         """,
                         (conv_id,),
                     )
-                elif row[0]:
-                    # Audio finished window has passed without chunks arriving.
+                elif over_grace:
                     cur.execute(
                         """
                         UPDATE pending_diarizations
@@ -239,7 +249,7 @@ def run_one() -> bool:
                         WHERE conversation_id = %s
                         """,
                         (
-                            f'no audio after {NO_AUDIO_GRACE_MINUTES}min grace from conversation finish',
+                            f'no audio after {NO_AUDIO_GRACE_MINUTES}min wait',
                             conv_id,
                         ),
                     )
@@ -250,7 +260,6 @@ def run_one() -> bool:
                         SET state = 'pending',
                             attempts = GREATEST(attempts - 1, 0),
                             enqueued_at = now() + make_interval(secs => %s),
-                            started_at = NULL,
                             error = 'audio not yet uploaded; will retry'
                         WHERE conversation_id = %s
                         """,
