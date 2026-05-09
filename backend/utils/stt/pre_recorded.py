@@ -1,9 +1,11 @@
 import os
+import threading
 from collections import defaultdict
 from io import BytesIO
 from typing import List, Optional, Sequence, Tuple, Union
 
 import fal_client
+import httpx
 from deepgram import DeepgramClient, DeepgramClientOptions
 
 from models.transcript_segment import TranscriptSegment
@@ -17,6 +19,20 @@ logger = logging.getLogger(__name__)
 # WARN: the pre-recorded transcription is available on deepgram cloud
 _deepgram_options = DeepgramClientOptions(options={"keepalive": "true"})
 _deepgram_client = DeepgramClient(os.getenv('DEEPGRAM_API_KEY'), _deepgram_options)
+
+# Self-hosted STT (whisper-shim) is single-threaded; the sync router fans out
+# segments via critical_executor (8 workers) which can flood it and trip the
+# SDK's per-call timeout. Gate calls with a bounded semaphore and pass an
+# explicit per-call timeout. Both are env-tunable; defaults preserve cloud
+# Deepgram behavior (no concurrency cap, SDK default timeout).
+_STT_PRERECORDED_MAX_CONCURRENCY = int(os.getenv('STT_PRERECORDED_MAX_CONCURRENCY', '0') or '0')
+_stt_prerecorded_semaphore: Optional[threading.Semaphore] = (
+    threading.Semaphore(_STT_PRERECORDED_MAX_CONCURRENCY) if _STT_PRERECORDED_MAX_CONCURRENCY > 0 else None
+)
+_STT_PRERECORDED_TIMEOUT_S = float(os.getenv('STT_PRERECORDED_TIMEOUT_S', '0') or '0')
+_stt_prerecorded_timeout: Optional[httpx.Timeout] = (
+    httpx.Timeout(_STT_PRERECORDED_TIMEOUT_S) if _STT_PRERECORDED_TIMEOUT_S > 0 else None
+)
 
 
 def _deepgram_client_for_request() -> DeepgramClient:
@@ -190,7 +206,15 @@ def deepgram_prerecorded(
             else:
                 options["keywords"] = list(keywords)
 
-        response = _deepgram_client_for_request().listen.rest.v("1").transcribe_url({"url": audio_url}, options)
+        if _stt_prerecorded_semaphore is not None:
+            _stt_prerecorded_semaphore.acquire()
+        try:
+            response = _deepgram_client_for_request().listen.rest.v("1").transcribe_url(
+                {"url": audio_url}, options, timeout=_stt_prerecorded_timeout
+            )
+        finally:
+            if _stt_prerecorded_semaphore is not None:
+                _stt_prerecorded_semaphore.release()
 
         # Extract words from response
         result = response.to_dict()
@@ -314,7 +338,15 @@ def deepgram_prerecorded_from_bytes(
         mimetype = "audio/raw" if encoding else "audio/wav"
         source = {"buffer": audio_buffer, "mimetype": mimetype}
 
-        response = _deepgram_client_for_request().listen.rest.v("1").transcribe_file(source, options)
+        if _stt_prerecorded_semaphore is not None:
+            _stt_prerecorded_semaphore.acquire()
+        try:
+            response = _deepgram_client_for_request().listen.rest.v("1").transcribe_file(
+                source, options, timeout=_stt_prerecorded_timeout
+            )
+        finally:
+            if _stt_prerecorded_semaphore is not None:
+                _stt_prerecorded_semaphore.release()
 
         # Extract words from response
         result = response.to_dict()
