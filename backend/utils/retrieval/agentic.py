@@ -6,6 +6,7 @@ to use to gather context and answer user questions. Uses Anthropic's native
 tool use API with streaming for real-time responses.
 """
 
+import os
 import uuid
 import asyncio
 import contextvars
@@ -51,6 +52,7 @@ from utils.llm.clients import anthropic_client, ANTHROPIC_AGENT_MODEL
 from utils.llm.chat import _get_agentic_qa_prompt
 from utils.other.endpoints import timeit
 from utils.observability.langsmith import is_langsmith_enabled
+from utils.retrieval.agentic_claude_sdk import execute_agentic_claude_sdk_stream
 import logging
 
 # Import langsmith traceable if available
@@ -507,7 +509,7 @@ async def _run_anthropic_agent_stream(
 # ---------------------------------------------------------------------------
 
 
-@_traceable(name="chat.anthropic.stream", run_type="chain")
+@_traceable(name="chat.agentic.stream", run_type="chain")
 async def execute_agentic_chat_stream(
     uid: str,
     messages: List[Message],
@@ -519,9 +521,26 @@ async def execute_agentic_chat_stream(
     """Execute an agentic chat interaction with streaming.
 
     Yields formatted chunks with "data: " or "think: " prefixes.
+
+    Backend selection via OMI_CHAT_BACKEND env var:
+      - "anthropic" (default)        — direct anthropic_client.messages.stream
+      - "claude-agent-sdk"           — host-side llm-proxy /v1/agent/chat
     """
-    # Build system prompt
+    # Build system prompt (shared across backends)
     system_prompt = _get_agentic_qa_prompt(uid, app, messages, context=context)
+
+    if os.environ.get("OMI_CHAT_BACKEND", "anthropic").strip() == "claude-agent-sdk":
+        async for chunk in execute_agentic_claude_sdk_stream(
+            uid=uid,
+            messages=messages,
+            app=app,
+            callback_data=callback_data,
+            chat_session=chat_session,
+            context=context,
+            system_prompt=system_prompt,
+        ):
+            yield chunk
+        return
 
     # Get prompt metadata for tracing/versioning
     prompt_name, prompt_commit, prompt_source = None, None, None
