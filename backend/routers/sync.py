@@ -46,13 +46,17 @@ from utils.other.storage import (
     download_audio_chunks_and_merge,
     get_or_create_merged_audio,
     get_merged_audio_signed_url,
+    upload_audio_chunks_batch,
+    OPUS_SAMPLE_RATE,
+    OPUS_CHANNELS,
 )
 
-# Local env read rather than importing STORAGE_DISABLED from utils.other.storage:
+# Local env reads rather than importing flags from utils.other.storage:
 # several sync tests replace the whole storage module with a MagicMock, so
-# `STORAGE_DISABLED` attribute access would resolve to a truthy MagicMock and
-# flip this branch on when it shouldn't be.
+# attribute access would resolve to a truthy MagicMock and flip these
+# branches on when they shouldn't be.
 STORAGE_DISABLED = os.getenv('STORAGE_DISABLED', 'false').lower() in ('true', '1', 'yes')
+LOCAL_AUDIO_ROOT = os.getenv('PENDANT_LOCAL_AUDIO_ROOT')
 
 from utils import encryption
 from utils.log_sanitizer import sanitize
@@ -1035,6 +1039,8 @@ def process_segment(
         else:
             closest_memory = get_closest_conversation_to_timestamps(uid, timestamp, segment_end_timestamp)
 
+        final_conversation_id: Optional[str] = None
+
         if not closest_memory:
             started_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             finished_at = datetime.fromtimestamp(segment_end_timestamp, tz=timezone.utc)
@@ -1048,6 +1054,7 @@ def process_segment(
             created = process_conversation(uid, language, create_memory)
             with lock:
                 response['new_memories'].add(created.id)
+            final_conversation_id = created.id
         else:
 
             transcript_segments = [s.dict() for s in transcript_segments]
@@ -1103,6 +1110,7 @@ def process_segment(
             with lock:
                 response['updated_memories'].add(closest_memory['id'])
             update_conversation_segments(uid, closest_memory['id'], segments, finished_at=new_finished_at)
+            final_conversation_id = closest_memory['id']
 
             # Lock existing conversation if credits exhausted
             if is_locked:
@@ -1113,6 +1121,32 @@ def process_segment(
                 reason = 'discarded' if closest_memory.get('discarded', False) else 'auto-sync'
                 logger.info(f'Conversation {closest_memory["id"]} reprocessing ({reason}) after segment merge')
                 _reprocess_conversation_after_update(uid, closest_memory['id'], language)
+
+        # Persist the audio segment to LOCAL_AUDIO_ROOT so the batch diarization
+        # worker (pusher.diarization_worker) can pick it up. Without this, the
+        # transcript reaches the conversation but the underlying audio is
+        # discarded — the worker then hits NoAudioYetError forever and
+        # eventually grace-fails. Gated on LOCAL_AUDIO_ROOT so non-pendant-stack
+        # deployments (where audio lives in GCS) are unaffected.
+        if LOCAL_AUDIO_ROOT and final_conversation_id:
+            try:
+                seg_audio = (
+                    AudioSegment.from_wav(path)
+                    .set_frame_rate(OPUS_SAMPLE_RATE)
+                    .set_channels(OPUS_CHANNELS)
+                    .set_sample_width(2)
+                )
+                upload_audio_chunks_batch(
+                    [{'data': seg_audio.raw_data, 'timestamp': float(timestamp)}],
+                    uid,
+                    final_conversation_id,
+                )
+                del seg_audio
+            except Exception as e:
+                logger.warning(
+                    f'sync: failed to persist audio chunk for diarization '
+                    f'(uid={uid} conv={final_conversation_id} path={path}): {e}'
+                )
     except Exception as e:
         error_msg = f'Failed to process segment {path}: {e}'
         logger.error(error_msg)
