@@ -139,3 +139,44 @@ def mark_job_failed(job_id: str, error: str) -> Optional[dict]:
             'error': error,
         },
     )
+
+
+def recover_orphaned_jobs() -> int:
+    """
+    Mark jobs left in 'queued' or 'processing' as failed.
+
+    Background workers run in-process; if the backend restarts mid-job, the
+    Redis record stays in 'processing' forever. The lazy stale-check in
+    get_sync_job only fires after STALE_THRESHOLD_SECONDS, so the client polls
+    a dead job for up to 10 minutes before retrying. Calling this on startup
+    flips orphans immediately so the next poll returns 'failed' and the client
+    re-uploads.
+
+    Returns the number of jobs recovered. Single-instance deployments only —
+    if you ever scale to multiple backend replicas, gate this behind ownership.
+    """
+    now = time.time()
+    recovered = 0
+    try:
+        for key in r.scan_iter(match=f'{JOB_KEY_PREFIX}*', count=200):
+            try:
+                data = r.get(key)
+                if not data:
+                    continue
+                job = json.loads(data)
+                if job.get('status') not in ('queued', 'processing'):
+                    continue
+                job['status'] = 'failed'
+                job['error'] = 'Backend restarted while processing'
+                job['completed_at'] = now
+                job['updated_at'] = now
+                r.set(key, json.dumps(job, default=str), ex=JOB_TTL_SECONDS)
+                recovered += 1
+            except Exception as e:
+                logger.warning(f'recover_orphaned_jobs: skipping {key}: {e}')
+    except Exception as e:
+        logger.warning(f'recover_orphaned_jobs: scan failed: {e}')
+        return 0
+    if recovered:
+        logger.info(f'recover_orphaned_jobs: marked {recovered} orphaned sync jobs as failed')
+    return recovered
